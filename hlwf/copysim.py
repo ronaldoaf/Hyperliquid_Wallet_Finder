@@ -1,0 +1,233 @@
+"""Simulate a follower who copies a wallet's perp positions with a delay.
+
+The follower holds, at every moment, the position the wallet held `delay`
+earlier (scaled to the follower's capital). Every change in the wallet's
+position becomes a market order of the follower, sent `delay` after the
+wallet's fill and executed at the open of the first price bar that starts
+after that moment, paying taker fee plus spread/impact. Fills that land in
+the same bar are netted, as a polling copier would do. The follower also
+pays or receives hourly funding on what it holds.
+
+Nothing here uses the wallet's own fill prices: a wallet that trades at
+prices nobody else can get (off-market prints, illiquid books) gets no
+credit for them.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+HOUR_MS = 3_600_000
+DAY_MS = 86_400_000
+EPS = 1e-12
+
+
+def market_kind(coin: str) -> str:
+    if coin.startswith("@") or "/" in coin:
+        return "spot"
+    if coin.startswith("#"):
+        return "outcome"
+    if ":" in coin:
+        return "hip3"
+    return "perp"
+
+
+def prepare_fills(rows: list[dict]) -> pd.DataFrame:
+    """API fill dicts -> perp/HIP-3 fills with signed size, in API order."""
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["time", "coin", "q", "startPosition", "px", "tid", "dir"])
+    df["kind"] = df["coin"].map(market_kind)
+    df = df[df["kind"].isin(("perp", "hip3"))].copy()
+    for c in ("px", "sz", "startPosition", "closedPnl", "fee"):
+        if c in df:
+            df[c] = df[c].astype(float)
+    df["q"] = np.where(df["side"] == "B", 1.0, -1.0) * df["sz"]
+    df["time"] = df["time"].astype(np.int64)
+    return df.sort_values("time", kind="mergesort").reset_index(drop=True)
+
+
+def position_events(fills: pd.DataFrame) -> dict:
+    """Per coin: (times, position after each time, position before the first).
+
+    Fills that share a timestamp are taken together: the group starts at the
+    one `startPosition` that is not another fill's end (the API order inside
+    a millisecond is not guaranteed) and ends at that plus the group's size.
+    If a group starts from a size different from where the previous one
+    ended (a TWAP slice or any fill the API no longer serves), the jump is
+    booked at that group's time, so the follower learns about it late, never
+    early.
+    """
+    out = {}
+    for coin, g in fills.groupby("coin", sort=False):
+        t = g["time"].to_numpy(np.int64)
+        s = g["startPosition"].to_numpy(float)
+        q = g["q"].to_numpy(float)
+        cut = np.r_[0, np.flatnonzero(t[1:] != t[:-1]) + 1, len(t)]
+        times = t[cut[:-1]]
+        pos = np.empty(len(times))
+        first = None
+        for k in range(len(times)):
+            a, b = cut[k], cut[k + 1]
+            if b - a == 1:
+                start = s[a]
+            else:
+                ends = set(np.round(s[a:b] + q[a:b], 9))
+                cands = [x for x in s[a:b] if round(x, 9) not in ends]
+                start = cands[0] if cands else s[a]
+            if first is None:
+                first = start
+            cur = start + q[a:b].sum()  # after a gap the exchange's startPosition wins
+            pos[k] = cur
+        pos = np.where(np.abs(pos) < 1e-10, 0.0, pos)
+        out[coin] = (times, pos, float(first))
+    return out
+
+
+@dataclass
+class CopyResult:
+    daily: pd.DataFrame                       # per UTC day: pnl, price, fees, funding, gross, capital, ret
+    by_coin: pd.DataFrame                     # per coin totals
+    trades: pd.DataFrame                      # follower orders
+    hourly_expo: pd.DataFrame = field(default_factory=pd.DataFrame)  # hours x coins, exposure / capital
+    hourly_ret: pd.DataFrame = field(default_factory=pd.DataFrame)   # hours x coins, return of the hour
+
+
+def _wallet_pos_at(times: np.ndarray, pos: np.ndarray, pos0: float, T: np.ndarray) -> np.ndarray:
+    if len(times) == 0:
+        return np.full(len(T), pos0)
+    i = np.searchsorted(times, T, side="right") - 1
+    return np.where(i >= 0, pos[np.maximum(i, 0)], pos0)
+
+
+def follower_orders(ev: tuple, oracle, delay_ms: int, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Orders of the follower in one coin: one per execution bar, netted.
+
+    At `start_ms` the follower takes whatever position the wallet held
+    `delay` earlier (a new follower copies open positions too)."""
+    times, pos, pos0 = ev
+    sel = (times + delay_ms > start_ms) & (times + delay_ms <= end_ms)
+    T = np.r_[start_ms, times[sel] + delay_ms]
+    target = np.r_[_wallet_pos_at(times, pos, pos0, np.array([start_ms - delay_ms]))[0], pos[sel]]
+    px, tx, src = oracle.exec_price(T)
+    ok = ~np.isnan(px) & (tx <= end_ms)
+    T, target, px, tx, src = T[ok], target[ok], px[ok], tx[ok], src[ok]
+    if len(T) == 0:
+        return pd.DataFrame(columns=["t_signal", "t_exec", "target", "q", "px", "src"])
+    # bars from different layers can come out of order: never trade back in time
+    mono = np.maximum.accumulate(tx)
+    fix = mono > tx
+    if fix.any():
+        p2, t2, s2 = oracle.exec_price(mono[fix])
+        px[fix], tx[fix], src[fix] = p2, t2, s2
+        tx = np.maximum.accumulate(tx)
+    df = pd.DataFrame({"t_signal": T - delay_ms, "t_exec": tx, "target": target, "px": px, "src": src})
+    df = df.groupby("t_exec", sort=True).agg(t_signal=("t_signal", "first"), target=("target", "last"),
+                                             px=("px", "first"), src=("src", "first")).reset_index()
+    df["q"] = df["target"].diff().fillna(df["target"])
+    return df[df["q"].abs() > EPS].reset_index(drop=True)
+
+
+def equity_on(equity: pd.Series | None, T: np.ndarray) -> np.ndarray:
+    """Wallet account value interpolated at times T (ms)."""
+    if equity is None or equity.empty:
+        return np.full(len(T), np.nan)
+    e = equity.sort_index()
+    return np.interp(T, e.index.to_numpy(np.int64).astype(float), e.to_numpy(float),
+                     left=float(e.iloc[0]), right=float(e.iloc[-1]))
+
+
+def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: int,
+             cost_bps: dict | None = None, funding: dict | None = None, equity: pd.Series | None = None,
+             max_leverage: float = 20.0, hourly: bool = True) -> CopyResult:
+    """Copy every coin in `events` and mark the follower to market daily.
+
+    Returns are PnL over the wallet's account value at the start of the day
+    (a follower who sizes in proportion to the wallet's equity), with the
+    capital floored at gross exposure (start or end of the day, whichever is
+    larger) / `max_leverage`, so that a stale or tiny equity reading cannot
+    blow up a return, and a follower never runs more than `max_leverage`.
+    """
+    cost_bps = cost_bps or {}
+    funding = funding or {}
+    day0 = (start_ms // DAY_MS) * DAY_MS
+    days = np.arange(day0, end_ms, DAY_MS, dtype=np.int64)  # days that start before the end
+    hours = np.arange(((start_ms + HOUR_MS - 1) // HOUR_MS) * HOUR_MS, end_ms, HOUR_MS, dtype=np.int64)
+    cols = {k: np.zeros(len(days)) for k in ("price", "fees", "funding", "gross")}
+    per_coin, all_trades, H_expo, H_ret, H_pos = [], [], {}, {}, {}
+    for coin, ev in events.items():
+        o = oracles.get(coin)
+        if o is None:
+            continue
+        tr = follower_orders(ev, o, delay_ms, start_ms, end_ms)
+        close = o.daily_close()
+        C = close.reindex(days).ffill().bfill().to_numpy(float) if len(close) else np.full(len(days), np.nan)
+        if np.isnan(C).all():
+            continue
+        # positions at the end of each day and trades inside each day
+        di = np.searchsorted(days, tr["t_exec"].to_numpy(np.int64), side="right") - 1
+        q = tr["q"].to_numpy(float)
+        px = tr["px"].to_numpy(float)
+        dq = np.bincount(di, weights=q, minlength=len(days))
+        eod = np.cumsum(dq)
+        sod = np.r_[0.0, eod[:-1]]
+        prev_C = np.r_[C[0], C[:-1]]
+        carry = sod * (C - prev_C)
+        trade = np.bincount(di, weights=q * (C[di] - px), minlength=len(days))
+        c_bps = cost_bps.get(coin, 0.0)
+        fee = np.bincount(di, weights=np.abs(q) * px * c_bps / 1e4, minlength=len(days))
+        price_pnl = carry + trade
+        fund = np.zeros(len(days))
+        if len(hours):
+            hp, _, _ = o.exec_price(hours)
+            hp = pd.Series(hp).ffill().bfill().to_numpy(float)
+            ti = np.searchsorted(tr["t_exec"].to_numpy(np.int64), hours, side="right") - 1
+            hpos = np.where(ti >= 0, np.cumsum(q)[np.maximum(ti, 0)], 0.0) if len(q) else np.zeros(len(hours))
+            fr = funding.get(coin)
+            if fr is not None and len(fr):
+                rate = fr.copy()
+                rate.index = (rate.index.to_numpy(np.int64) // HOUR_MS) * HOUR_MS
+                rate = rate.groupby(level=0).last().reindex(hours).fillna(0.0).to_numpy(float)
+                fpay = -hpos * hp * rate
+                hd = np.searchsorted(days, hours, side="right") - 1
+                fund = np.bincount(hd, weights=fpay, minlength=len(days))
+            if hourly:
+                H_pos[coin] = hpos * hp
+                nxt = np.r_[hp[1:], np.nan]
+                H_ret[coin] = nxt / hp - 1.0
+        cols["price"] += price_pnl
+        cols["fees"] -= fee
+        cols["funding"] += fund
+        cols["gross"] += np.abs(eod) * C
+        n_open = int(((np.abs(np.r_[0.0, np.cumsum(q)[:-1]]) < EPS) & (np.abs(np.cumsum(q)) > EPS)).sum()) if len(q) else 0
+        per_coin.append({"coin": coin, "price": float(price_pnl.sum()), "fees": float(-fee.sum()),
+                         "funding": float(fund.sum()), "orders": len(tr), "opens": n_open,
+                         "volume": float((np.abs(q) * px).sum()), "cost_bps": c_bps})
+        if len(tr):
+            tr = tr.assign(coin=coin)
+            all_trades.append(tr)
+    daily = pd.DataFrame(cols, index=pd.Index(days, name="day"))
+    daily["pnl"] = daily["price"] + daily["fees"] + daily["funding"]
+    eq = equity_on(equity, days.astype(float))
+    g = daily["gross"].to_numpy()
+    gross_prev = np.r_[g[0], g[:-1]]
+    cap = np.fmax(eq, np.maximum(gross_prev, g) / max_leverage)
+    cap = np.where(np.isnan(cap) | (cap < 1.0), np.nan, cap)
+    daily["equity"] = eq
+    daily["capital"] = cap
+    daily["ret"] = np.where(np.isnan(cap), 0.0, daily["pnl"] / np.where(np.isnan(cap), 1.0, cap))
+    daily.index = pd.to_datetime(daily.index, unit="ms")
+    by_coin = pd.DataFrame(per_coin)
+    if len(by_coin):
+        by_coin["pnl"] = by_coin["price"] + by_coin["fees"] + by_coin["funding"]
+        by_coin = by_coin.sort_values("pnl", ascending=False).reset_index(drop=True)
+    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    he = hr = pd.DataFrame()
+    if hourly and H_pos:
+        capd = pd.Series(cap, index=days).ffill().bfill()
+        hcap = capd.reindex(hours, method="ffill").bfill().to_numpy(float)
+        he = pd.DataFrame(H_pos, index=hours).div(np.where(np.isnan(hcap), np.inf, hcap), axis=0)
+        hr = pd.DataFrame(H_ret, index=hours)
+    return CopyResult(daily=daily, by_coin=by_coin, trades=trades, hourly_expo=he, hourly_ret=hr)
