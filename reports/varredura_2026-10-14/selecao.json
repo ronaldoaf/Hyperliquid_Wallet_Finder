@@ -1,0 +1,36 @@
+{
+ "selected_at": 1792006394086,
+ "split_ms": 1781568000000,
+ "wallets": [
+  {
+   "address": "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1",
+   "verdict": "promissora",
+   "ret_ann_30": 0.6366908023333693,
+   "q": 0.8773399030664452
+  },
+  {
+   "address": "0xe8681168f59af16c60c805dab7842eb75f127879",
+   "verdict": "promissora",
+   "ret_ann_30": 0.48940977832997085,
+   "q": 0.8773399030664452
+  },
+  {
+   "address": "0x2312171890250347dbf1b082bdf7950504909e92",
+   "verdict": "promissora",
+   "ret_ann_30": 0.6991303142211142,
+   "q": 0.8773399030664452
+  },
+  {
+   "address": "0xb69eec8fea0081343c3b09e652ba1fa7dcf7033a",
+   "verdict": "promissora",
+   "ret_ann_30": 15.333635542895415,
+   "q": 0.8773399030664452
+  },
+  {
+   "address": "0x352deb23bebae8b4c57d0ae341d9c1951fd8425a",
+   "verdict": "promissora",
+   "ret_ann_30": 0.5621590145262546,
+   "q": 0.8773399030664452
+  }
+ ]
+}

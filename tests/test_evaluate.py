@@ -42,7 +42,8 @@ def test_short_sample_is_insufficient():
 
 
 def test_inactive_wallet_is_flagged():
-    assert classify(summary(last_fill=NOW - 60 * D), CFG, q=0.02)[0] == "aprovada (inativa)"
+    v, why = classify(summary(last_fill=NOW - 60 * D), CFG, q=0.02)
+    assert v == "aprovada (inativa)" and any("sem ordens" in w for w in why)
 
 
 def test_finalize_counts_untestable_wallets_as_p1():
@@ -60,8 +61,15 @@ def test_insample_loser_leaves_the_family():
     good = summary(p=0.001)
     bad = summary(p=0.0001)
     bad["address"] = "0xdef"
-    bad["is_30"] = {"days": 30, "ret_ann": -0.2}
+    bad["is_30"] = {"days": 30, "active_days": 30, "ret_ann": -0.2}
     table = finalize([good, bad], CFG).set_index("address")
     assert not table.loc["0xdef", "in_family"] and table.loc["0xdef", "verdict"] == "reprovada"
     # the family has one test, so q equals p
     assert table.loc["0xabc", "q"] == 0.001
+
+
+def test_wallet_idle_before_split_stays_in_family():
+    idle = summary(p=0.001)
+    idle["is_30"] = {"days": 30, "active_days": 0, "ret_ann": 0.0}
+    table = finalize([idle], CFG).set_index("address")
+    assert table.loc["0xabc", "in_family"]

@@ -4,7 +4,16 @@ Localiza carteiras da Hyperliquid cuja estratégia em perps é **lucrativa com e
 
 Usa só dados públicos: o leaderboard (`stats-data.hyperliquid.xyz`), a Info API (`POST https://api.hyperliquid.xyz/info`, sem chave) e, para preços intradiários antigos, o arquivo público de velas da Binance. Parte da coleta e da análise vem do projeto [Hyperliquid_RE](https://github.com/ronaldoaf/Hyperliquid_RE) (cliente da API, cadeia de posição pelos fills, cópia com atraso), aqui reescrita para rodar em milhares de carteiras.
 
-**Resultado da última varredura:** [`reports/varredura_2026-10-14/RELATORIO.md`](reports/varredura_2026-10-14/RELATORIO.md).
+## Resultado da varredura de 14/10/2026
+
+Relatório completo: [`reports/varredura_2026-10-14/RELATORIO.md`](reports/varredura_2026-10-14/RELATORIO.md).
+
+- **Universo:** as 7.147 carteiras com volume total ≥ US$ 100M (de 47.188 no leaderboard). Corte em 16/06/2026; teste da cópia de 16/06 a 14/10/2026 (121 dias).
+- **Funil:** 1.966 pontuáveis antes do corte → 150 simuladas → 118 na família do teste final → 52 com dados suficientes no teste (as outras 66 da etapa C não têm fills que cubram o período, ou entraram poucas vezes).
+- **Nenhuma carteira passou em todos os critérios.** Com 118 testes, a melhor precisaria de p ≈ 0,0008; a melhor teve p = 0,013.
+- **5 promissoras** (lucro com 30 min, 1 h e 2 h de atraso depois do corte, p < 0,05 sem correção, e a maioria com teste de deslocamento p < 0,1): [`0xf97a…ddd1`](reports/varredura_2026-10-14/RELATORIO.md#0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1), [`0xe868…7879`](reports/varredura_2026-10-14/RELATORIO.md#0xe8681168f59af16c60c805dab7842eb75f127879), [`0x2312…9e92`](reports/varredura_2026-10-14/RELATORIO.md#0x2312171890250347dbf1b082bdf7950504909e92), [`0xb69e…033a`](reports/varredura_2026-10-14/RELATORIO.md#0xb69eec8fea0081343c3b09e652ba1fa7dcf7033a) (alavancada, queda de 76% no teste, sem ordens novas desde 05/09/2026 mas ainda posicionada) e [`0x352d…425a`](reports/varredura_2026-10-14/RELATORIO.md#0x352deb23bebae8b4c57d0ae341d9c1951fd8425a). O acaso sozinho daria ~2,6 carteiras com p < 0,05 entre 52: são candidatas para acompanhar com `track`, não para copiar já.
+- **O atraso não é o problema; a persistência é.** Entre as carteiras que lucraram copiando na hora, a cópia com 30 min e custos manteve a mediana de 78% do retorno. O que falha é o desempenho passado se repetir: depois do corte, o próprio trader (cópia imediata, sem custos) teve 5 resultados com p < 0,05 entre 52, perto dos 2,6 do acaso, num período em que o BTC subiu 26%.
+- **Validação nas 10 carteiras do [Hyperliquid_RE](https://github.com/ronaldoaf/Hyperliquid_RE)** ([`reports/carteiras/avulsas_2026-06-16.md`](reports/carteiras/avulsas_2026-06-16.md)): o resultado bate com as análises de lá. A `0x8bae` (lucro de fills fora do preço de mercado) perde dinheiro quando copiada a mercado; o bot HFT `0x78dc` não tem fills que cubram o teste (a API guarda só os últimos dias dele); o carry `0x833b` perde (é uma perna de um *hedge*); as de posição longa (`0xcac1`, `0xfce0`, `0x16bf`) têm poucas entradas para teste; a `0x0812` sai como promissora, e a análise de lá já dizia que a amostra era curta.
 
 ## Como usar
 
@@ -16,7 +25,8 @@ pip install -r requirements.txt
 python -m hlwf portfolios --min-volume 5e7
 
 # 2. varredura completa: pontua antes do corte, testa a cópia depois do corte, gera o relatório
-python -m hlwf scan --split-days 120 --top 150
+#    (~1,5 h para 150 carteiras na primeira vez; preços e fills ficam em cache)
+python -m hlwf scan --min-volume 5e7 --split-days 120 --top 150
 
 # testar carteiras específicas (cada uma é um teste isolado)
 python -m hlwf wallet 0xENDERECO1 0xENDERECO2
@@ -41,7 +51,7 @@ A pergunta tem duas partes, e cada uma tem uma armadilha.
 
 ### Etapa A: leaderboard (uma chamada)
 
-Mantém as carteiras com volume total ≥ US$ 50M (12,2 mil de 47 mil). **Nenhum filtro de PnL, ROI ou patrimônio atual**: esses números incluem o período de teste. Filtrar por eles excluiria, antes do teste, quem quebrou depois do corte, e o teste ficaria otimista (viés de sobrevivência). A opção `--leaky` liga esses filtros para uma varredura rápida, sabendo do viés.
+Mantém as carteiras com volume total ≥ US$ 50M (12,2 mil de 47 mil; a varredura de 14/10/2026 usou ≥ US$ 100M, 7,1 mil, para caber no tempo). **Nenhum filtro de PnL, ROI ou patrimônio atual**: esses números incluem o período de teste. Filtrar por eles excluiria, antes do teste, quem quebrou depois do corte, e o teste ficaria otimista (viés de sobrevivência). A opção `--leaky` liga esses filtros para uma varredura rápida, sabendo do viés.
 
 ### Etapa B: histórico semanal até o corte (uma chamada por carteira)
 

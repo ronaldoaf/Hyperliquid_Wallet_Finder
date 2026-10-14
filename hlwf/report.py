@@ -10,10 +10,31 @@ import pandas as pd
 from .charts import copy_curves
 from .evaluate import Settings
 from .pipeline import load_daily, run_dir
-from .store import save_json
+from .store import load_gz, save_json
 
 EXPLORER = "https://app.hyperliquid.xyz/explorer/address/"
 ORDER = ["aprovada", "aprovada (inativa)", "promissora", "reprovada", "dados insuficientes", "erro"]
+
+
+PLURAL = {"aprovada": "aprovadas", "aprovada (inativa)": "aprovadas (inativas)", "promissora": "promissoras",
+          "reprovada": "reprovadas", "dados insuficientes": "com dados insuficientes", "erro": "erros"}
+
+
+def conclusion(counts: Counter, table: pd.DataFrame, cfg: Settings) -> str:
+    n_ok = counts.get("aprovada", 0) + counts.get("aprovada (inativa)", 0)
+    n_pr = counts.get("promissora", 0)
+    if n_ok:
+        return (f"{n_ok} carteira(s) passaram em todos os critérios. Ainda assim, acompanhe-as com `track` antes "
+                "de copiar: o teste cobre só alguns meses.")
+    fam = int(table["in_family"].fillna(False).astype(bool).sum())
+    best = table[table["in_family"].fillna(False).astype(bool)]["p_30"].min()
+    txt = (f"nenhuma carteira passou. Com {fam} testes na família, a correção de Benjamini-Hochberg pede um "
+           f"p perto de {num(cfg.q_max / max(fam, 1), 4)} para a melhor; a melhor teve p = {num(best, 4)}. ")
+    if n_pr:
+        txt += (f"As {n_pr} promissoras continuaram lucrando com atraso e custos depois do corte, mas um resultado "
+                "assim aparece por acaso entre tantas carteiras. O próximo passo é acompanhá-las daqui para frente "
+                "(`track`) e só considerar copiar as que mantiverem o resultado.")
+    return txt
 
 
 def short(a: str) -> str:
@@ -66,6 +87,8 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
     a = s["address"]
     st = s.get("style") or {}
     L = [f"### [{short(a)}]({EXPLORER}{a}) — {s['verdict']}", "", f"`{a}`", ""]
+    if not s.get(f"oos_{cfg.main_delay_min}"):
+        return L + [f"- **Sem teste:** {'; '.join(s.get('why') or [s.get('reason', '')])}.", ""]
     if img_rel:
         L += [f"![cópia com atraso]({img_rel})", ""]
     L += ["| atraso | dias | retorno a.a. | Sharpe a.a. | t (HAC) | queda máx. | PnL (escala da carteira) | taxas+spread | funding |",
@@ -114,6 +137,51 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
     return L
 
 
+def btc_change(data_dir: str, start_ms: int, end_ms: int) -> float | None:
+    rows = load_gz(os.path.join(data_dir, "market", "candles", "BTC_1d.json.gz")) or []
+    c = pd.Series({r[0]: r[2] for r in rows}).sort_index()
+    a, b = c[c.index <= start_ms], c[c.index <= end_ms]
+    if a.empty or b.empty:
+        return None
+    return float(b.iloc[-1] / a.iloc[-1] - 1)
+
+
+def persistence_section(table: pd.DataFrame, results: list[dict], cfg: Settings, data_dir: str = "data") -> list[str]:
+    """Is the failure the trader's (no edge after the split) or the copy's
+    (delay and costs)? And how many hits would chance alone produce?"""
+    by = {s["address"]: s for s in results}
+    fam = table[table["in_family"].fillna(False).astype(bool)]
+    testable = fam[fam["verdict"] != "dados insuficientes"]
+    n = len(testable)
+    if n == 0:
+        return []
+    def count(key, thr):
+        c = 0
+        for a in testable["address"]:
+            x = by[a].get(key) or {}
+            if x.get("p", 1.0) < thr and x.get("ret_ann", 0) > 0:
+                c += 1
+        return c
+    k = cfg.main_delay_min
+    L = ["## O que sobra do passado", "",
+         f"Das {len(fam)} carteiras da família, {n} tinham dados para o teste. Se nenhuma tivesse vantagem real, "
+         f"o acaso daria cerca de {num(n * 0.05, 1)} com p < 0,05 e {num(n * 0.01, 1)} com p < 0,01, e metade "
+         "teria retorno médio positivo.", "",
+         "| cópia | p < 0,05 | p < 0,01 | retorno médio > 0 |", "|---|---|---|---|"]
+    for key, lab in ((("oos_ref", "imediata, sem custos (o próprio trader)"), (f"oos_{k}", f"{k} min, com custos"))
+                     + tuple((f"oos_{d}", f"{d // 60} h, com custos") for d in cfg.robust_delays_min)):
+        pos = sum(1 for a in testable["address"] if (by[a].get(key) or {}).get("ret_ann", 0) > 0)
+        L.append(f"| {lab} | {count(key, 0.05)} | {count(key, 0.01)} | {pos} de {n} |")
+    ch = btc_change(data_dir, cfg.split_ms, cfg.end_ms)
+    if ch is not None:
+        L += ["", f"No mesmo período o BTC variou {pct(ch)}: retorno positivo sozinho pode ser só direção do mercado, "
+              "por isso o teste de deslocamento e o alfa."]
+    L += ["", "A linha de cima mede se o trader manteve a vantagem depois do corte; as de baixo, quanto dela "
+          "sobrevive ao atraso e aos custos. Quando a linha de cima já fica perto do acaso, o problema não é o "
+          "atraso: o desempenho passado das carteiras não se repetiu.", ""]
+    return L
+
+
 def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, funnel: dict, b: pd.DataFrame,
                       table: pd.DataFrame, results: list[dict]) -> str:
     date = pd.Timestamp(cfg.end_ms, unit="ms").strftime("%Y-%m-%d")
@@ -148,7 +216,9 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
         f"positivo → **{funnel['stage_c']} simuladas** (as de maior t semanal antes do corte) → "
         f"**{funnel.get('family', funnel['stage_c'])} na família do teste final** (as que não perdiam dinheiro "
         f"copiando com {cfg.main_delay_min} min nos {cfg.insample_days} dias antes do corte).".replace(",", "."),
-        "- **Resultado:** " + ", ".join(f"{counts.get(v, 0)} {v}" for v in ORDER if counts.get(v, 0)) + ".",
+        "- **Resultado:** " + ", ".join(f"{counts.get(v, 0)} {PLURAL[v] if counts.get(v, 0) > 1 else v}"
+                                        for v in ORDER if counts.get(v, 0)) + ".",
+        "- **Conclusão:** " + conclusion(counts, table, cfg),
         f"- **Custos do copiador:** taxa *taker* de {num(cfg.taker_bps, 1)} bp (HIP-3: {num(cfg.hip3_fee_mult, 0)}x) "
         "mais meio spread/impacto por faixa de liquidez (1–25 bp), funding horário real nas moedas relevantes; "
         f"alavancagem do copiador limitada a {cfg.max_leverage:.0f}x.",
@@ -190,13 +260,14 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
         L += ["## Nenhuma carteira passou", "",
               "Nenhuma carteira testada atendeu aos critérios. Isso é um resultado: o teste fora da amostra com "
               "correção para múltiplos testes é exigente de propósito.", ""]
+    L += persistence_section(table, results, cfg, data_dir)
     # why the rest failed
     rest = table[~table["verdict"].isin(["aprovada", "aprovada (inativa)", "promissora"])]
     reasons = Counter()
     for w in rest["why"].fillna(""):
-        for part in w.split("; "):
+        for part in w.replace("; fills só desde", ", fills só desde").split("; "):
             if part:
-                key = part.split(" (")[0]
+                key = part.split(" (")[0].replace("dias, fills", "dias")
                 reasons[key] += 1
     if reasons:
         L += ["## Por que as outras não passaram", "",
@@ -221,8 +292,9 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
           "- `selecao.json`: as aprovadas e promissoras, com a data, para acompanhar daqui para frente "
           "(`python -m hlwf track reports/varredura_…/selecao.json`).", "",
           "## Limitações", "",
-          "- A cópia é simulada com velas de 5 min (Hyperliquid nos últimos 17 dias, Binance antes, validada contra o "
-          "fechamento diário da Hyperliquid); moedas sem Binance usam velas de 15 min a 4 h, e o atraso efetivo fica maior.",
+          "- A cópia é simulada com velas de 5 min (Binance até ontem, validada contra o fechamento diário da "
+          "Hyperliquid, e Hyperliquid nas últimas horas). Moedas sem Binance (HIP-3 e as exclusivas da Hyperliquid) "
+          "usam velas de 15 min nos últimos 52 dias e de 1 h antes disso: o atraso efetivo fica maior (mais conservador).",
           "- Spread e impacto são estimados pela liquidez de hoje, não a da época. Copiadores grandes pagam mais.",
           "- Posições em HIP-3 abertas antes do período de fills e nunca mexidas não aparecem (o estado aberto só é lido "
           "da bolsa principal). Ordens TWAP antigas podem faltar; o salto de posição é aplicado no fill seguinte.",

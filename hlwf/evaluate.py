@@ -108,7 +108,7 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
         # the API no longer serves the fills of the test period: stop before
         # spending requests on prices
         out.update(status="insuficiente", oos_days=float(oos_days),
-                   reason=f"período fora da amostra curto ({oos_days:.0f} dias; fills só desde "
+                   reason=f"período fora da amostra curto ({oos_days:.0f} dias, fills só desde "
                           f"{pd.Timestamp(cov, unit='ms'):%d/%m/%Y})")
         return out, art
     eq = equity_series(data_dir, addr)
@@ -190,7 +190,7 @@ def sample_problem(s: dict, cfg: Settings) -> str | None:
     if s.get("status") in ("reprovada", "erro", "insuficiente"):
         return s.get("reason", "")
     if s.get("oos_days", 0) < cfg.min_oos_days or main.get("days", 0) < cfg.min_oos_days:
-        return (f"período fora da amostra curto ({s.get('oos_days', 0):.0f} dias; fills só desde "
+        return (f"período fora da amostra curto ({s.get('oos_days', 0):.0f} dias, fills só desde "
                 f"{pd.Timestamp(s['coverage_start'], unit='ms'):%d/%m/%Y})")
     if main.get("active_days", cfg.min_active_days) < cfg.min_active_days:
         return f"posicionada em poucos dias do teste ({main.get('active_days')})"
@@ -216,7 +216,7 @@ def classify(s: dict, cfg: Settings, q: float | None) -> tuple[str, list[str]]:
         if not x.get("ret_ann", 0) > 0:
             fails.append(f"com {d} min de atraso perde dinheiro")
     if q is None or not q <= cfg.q_max:
-        fails.append(f"não significativo após correção para múltiplos testes (q = {q:.2f})" if q is not None
+        fails.append(f"não significativo após correção para múltiplos testes (q = {q:.2f})".replace(".", ",") if q is not None
                      else "sem valor-q")
     sh = (s.get("shift") or {}).get("p")
     ta = (s.get("alpha") or {}).get("t_alpha")
@@ -227,7 +227,8 @@ def classify(s: dict, cfg: Settings, q: float | None) -> tuple[str, list[str]]:
         fails.append("lucro depende dos 5 melhores dias")
     last = s.get("last_fill")
     if last is None or (cfg.end_ms - last) > cfg.inactive_after_days * DAY_MS:
-        soft.append("inativa nos últimos 30 dias")
+        soft.append(f"sem ordens nos últimos {cfg.inactive_after_days} dias"
+                    + (" (segue com posições abertas)" if s.get("open_positions") else ""))
     if not fails:
         return ("aprovada" if not soft else "aprovada (inativa)"), soft
     if main.get("p", 1) <= 0.05 and main.get("ret_ann", 0) > 0 and (s.get("oos_60") or {}).get("ret_ann", 0) > 0:

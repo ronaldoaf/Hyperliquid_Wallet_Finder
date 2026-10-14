@@ -59,7 +59,11 @@ def evaluate_many(addrs, cfg: Settings, data_dir: str, client: InfoClient, tag: 
             continue
         try:
             s, art = evaluate_wallet(a, cfg, market, client, data_dir)
-            save_daily(os.path.join(d, f"{a}.csv.gz"), art)
+            csv = os.path.join(d, f"{a}.csv.gz")
+            if art.get("daily"):
+                save_daily(csv, art)
+            elif os.path.exists(csv):
+                os.remove(csv)  # left over from an earlier run
         except Exception as e:  # one broken wallet must not stop the scan
             s = {"address": a, "status": "erro", "reason": f"{type(e).__name__}: {e}",
                  "trace": traceback.format_exc()[-2000:]}
@@ -84,7 +88,8 @@ def fails_insample(s: dict, cfg: Settings) -> bool:
     if not cfg.insample_screen:
         return False
     x = s.get(f"is_{cfg.main_delay_min}") or {}
-    return x.get("days", 0) >= 14 and not x.get("ret_ann", 0) > 0
+    # judged only if the wallet was actually positioned before the split
+    return x.get("days", 0) >= 14 and x.get("active_days", 0) >= 10 and x.get("ret_ann", 0) < 0
 
 
 def finalize(results: list[dict], cfg: Settings) -> pd.DataFrame:
@@ -209,7 +214,8 @@ def run_wallets(addrs, data_dir: str = "data", out_root: str = "reports", split_
     client = InfoClient(budget=budget)
     addrs = [x.lower() for x in addrs]
     fetch_portfolios(client, addrs, data_dir, max_age_h=6)
-    cfg = Settings(split_ms=split, end_ms=now, **(cfg_kw or {}))
+    # no selection here, so no family to trim: each wallet is judged on its own test
+    cfg = Settings(split_ms=split, end_ms=now, **({"insample_screen": False} | (cfg_kw or {})))
     tag = tag or pd.Timestamp(split, unit="ms").strftime("avulsas_%Y-%m-%d")
     results = evaluate_many(addrs, cfg, data_dir, client, tag, verbose=True, reuse=False)
     table = finalize(results, cfg)
