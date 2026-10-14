@@ -48,6 +48,13 @@ class InfoClient:
         self.session = requests.Session()
         self.calls = 0
         self.usage: collections.Counter = collections.Counter()  # weight spent per request type
+        self._perp_dexes: list[str] | None = None
+
+    def perp_dexes(self) -> list[str]:
+        """Names of the HIP-3 perp dexes (the main dex, unnamed, is left out)."""
+        if self._perp_dexes is None:
+            self._perp_dexes = [d["name"] for d in self.post({"type": "perpDexs"}) if d]
+        return self._perp_dexes
 
     def _window(self) -> int:
         now = time.monotonic()
@@ -94,14 +101,22 @@ class InfoClient:
                       key: Callable[[dict], Any] = lambda x: (x.get("time"), x.get("hash"), str(x)),
                       time_of: Callable[[dict], int] = lambda x: int(x["time"]),
                       page_limit: int = 500, max_pages: int | None = None,
-                      stop: Callable[[list], bool] | None = None) -> list[dict]:
+                      first_page_stop: Callable[[list], bool] | None = None,
+                      status: dict | None = None) -> list[dict]:
         """Walk forward over an endpoint that takes startTime/endTime and returns
         the oldest `page_limit` rows of the window. The next page starts at the
-        last timestamp seen (rows sharing it across pages are deduplicated)."""
+        last timestamp seen (rows sharing it across pages are deduplicated).
+
+        `first_page_stop(page)` is checked on the first page only: True ends
+        the walk there. If `status` is given, it gets `complete` (False when
+        `max_pages` or `first_page_stop` cut the walk short) and `complete_to`:
+        the time up to which every row was walked (`end_ms` if complete; else
+        just before the last timestamp seen, whose rows may continue on the
+        next page)."""
         end_ms = end_ms or int(time.time() * 1000)
         seen: set = set()
         out: list[dict] = []
-        cur, pages = start_ms, 0
+        cur, pages, complete = start_ms, 0, True
         while cur <= end_ms:
             page = self.post({**body, "startTime": cur, "endTime": end_ms})
             pages += 1
@@ -115,10 +130,16 @@ class InfoClient:
                     out.append(item)
                     new += 1
             last_t = max(time_of(x) for x in page)
-            if len(page) < page_limit or (max_pages and pages >= max_pages) or (stop and stop(page)):
+            if len(page) < page_limit:
+                break
+            if (max_pages and pages >= max_pages) or (pages == 1 and first_page_stop and first_page_stop(page)):
+                complete = False
                 break
             cur = last_t + 1 if new == 0 else last_t
         out.sort(key=time_of)
+        if status is not None:
+            status["complete"] = complete
+            status["complete_to"] = int(end_ms if complete else last_t - 1)
         return out
 
 

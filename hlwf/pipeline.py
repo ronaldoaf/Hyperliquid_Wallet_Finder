@@ -2,8 +2,10 @@
 out of sample, with the false discovery rate controlled across wallets."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 import time
 import traceback
 
@@ -20,8 +22,37 @@ from .store import load_json, save_json
 DAY_MS = 86_400_000
 
 
+# the modules whose code decides a wallet's result
+RESULT_MODULES = ("api.py", "wallet.py", "market.py", "copysim.py", "stats.py", "evaluate.py")
+
+
 def run_dir(data_dir: str, tag: str) -> str:
     return os.path.join(data_dir, "results", tag)
+
+
+def code_hash() -> str:
+    h = hashlib.sha1()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for fn in RESULT_MODULES:
+        with open(os.path.join(here, fn), "rb") as f:
+            h.update(fn.encode() + f.read())
+    return h.hexdigest()[:12]
+
+
+def git_commit() -> str | None:
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def run_stamp(cfg: Settings) -> dict:
+    """What a saved result depends on: the settings (end date included) and the code."""
+    blob = json.dumps(settings_dict(cfg), sort_keys=True, default=str).encode()
+    return {"end_ms": int(cfg.end_ms), "settings_hash": hashlib.sha1(blob).hexdigest()[:12],
+            "code_hash": code_hash(), "commit": git_commit()}
 
 
 def save_daily(path: str, art: dict) -> None:
@@ -50,15 +81,19 @@ def evaluate_many(addrs, cfg: Settings, data_dir: str, client: InfoClient, tag: 
     d = run_dir(data_dir, tag)
     os.makedirs(d, exist_ok=True)
     market = Market(client, data_dir, verbose=False)
+    stamp = run_stamp(cfg)
     out = []
     t0 = time.time()
     for i, a in enumerate(addrs):
         jp = os.path.join(d, f"{a}.json")
-        if reuse and os.path.exists(jp):
-            out.append(load_json(jp))
+        old = load_json(jp) if reuse else None
+        # a result is reused only if made by the same code with the same settings (errors are retried)
+        if old and old.get("status") != "erro" and all(old.get(k) == stamp[k] for k in ("settings_hash", "code_hash")):
+            out.append(old)
             continue
         try:
             s, art = evaluate_wallet(a, cfg, market, client, data_dir)
+            s.update(stamp)
             csv = os.path.join(d, f"{a}.csv.gz")
             if art.get("daily"):
                 save_daily(csv, art)
@@ -66,7 +101,7 @@ def evaluate_many(addrs, cfg: Settings, data_dir: str, client: InfoClient, tag: 
                 os.remove(csv)  # left over from an earlier run
         except Exception as e:  # one broken wallet must not stop the scan
             s = {"address": a, "status": "erro", "reason": f"{type(e).__name__}: {e}",
-                 "trace": traceback.format_exc()[-2000:]}
+                 "trace": traceback.format_exc()[-2000:], **stamp}
         save_json(jp, s)
         out.append(s)
         if verbose:
@@ -165,18 +200,33 @@ def flat_row(s: dict, cfg: Settings) -> dict:
     ins = s.get(f"is_{k}") or {}
     row["is_ret_ann_30"] = ins.get("ret_ann")
     row["is_t_30"] = ins.get("t")
+    row["ret_comp_30"] = m.get("ret_comp")
+    row["ruined_30"] = m.get("ruined")
+    row["n_twap"] = s.get("n_twap")
+    row["jump_share"] = s.get("jump_share")
+    row["recon_share"] = (s.get("recon") or {}).get("share")
+    row["pnl_check_oos"] = (s.get("pnl_check_oos") or {}).get("rel")
     return row
 
 
 def run_scan(data_dir: str = "data", out_root: str = "reports", split_days: int = 120, top: int = 150,
              min_volume: float = 50e6, leaky: bool = False, budget: int = 1100, fetch_missing: bool = False,
-             cfg_kw: dict | None = None, verbose: bool = True) -> str:
+             cfg_kw: dict | None = None, verbose: bool = True, resume: bool = True) -> str:
     from .report import write_scan_report
 
     now = int(time.time() * 1000)
     end = now
     split = ((now - split_days * DAY_MS) // DAY_MS) * DAY_MS  # a UTC midnight
     tag = pd.Timestamp(split, unit="ms").strftime("corte_%Y-%m-%d")
+    # an interrupted scan of the same day resumes with the same end date, so
+    # its saved results stay valid; anything else starts over
+    run_file = os.path.join(run_dir(data_dir, tag), "_run.json")
+    prev = load_json(run_file) if resume else None
+    if prev and prev.get("code_hash") == code_hash() and now - prev["end_ms"] < DAY_MS:
+        end = int(prev["end_ms"])
+        if verbose:
+            print(f"resuming the scan that started at {pd.Timestamp(end, unit='ms'):%Y-%m-%d %H:%M} UTC", flush=True)
+    save_json(run_file, {"end_ms": end, "split_ms": split, "code_hash": code_hash()})
     client = InfoClient(budget=budget)
     lb = load_leaderboard(data_dir)
     a = stage_a(lb, min_volume=min_volume, leaky=leaky)
@@ -201,7 +251,7 @@ def run_scan(data_dir: str = "data", out_root: str = "reports", split_days: int 
               "min_volume": min_volume, "leaky": leaky, "top": top}
     path = write_scan_report(out_root, data_dir, tag, cfg, funnel, b, table, results)
     save_json(os.path.join(run_dir(data_dir, tag), "_meta.json"),
-              {"settings": settings_dict(cfg), "funnel": funnel, "generated_at": now})
+              {"settings": settings_dict(cfg), "funnel": funnel, "generated_at": now, **run_stamp(cfg)})
     return path
 
 

@@ -107,7 +107,9 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
     L += [
         f"- **Teste fora da amostra** ({day(s['oos_start'])} → hoje, cópia com {cfg.main_delay_min} min, atraso efetivo médio de "
         f"{num(s.get('eff_delay_min'), 0)} min; posicionada em {m.get('active_days', '–')} dias): p = {num(s.get('p_used'), 4)}, q (BH) = {num(s.get('q'), 3)}"
-        + (f"; intervalo de 90% do retorno a.a. (bootstrap em blocos): {pct(ci[0])} a {pct(ci[1])}" if ci else "") + ".",
+        + (f"; intervalo de 90% do retorno a.a. (bootstrap em blocos): {pct(ci[0])} a {pct(ci[1])}" if ci else "")
+        + (f"; retorno composto no período: {pct(m.get('ret_comp'))}" if m.get("ret_comp") is not None else "")
+        + ("; **a cópia perderia todo o capital num dia**" if m.get("ruined") else "") + ".",
         f"- **É habilidade ou mercado?** Teste de deslocamento (mesmas posições em outras datas): p = {num(sh.get('p'), 3)}. "
         f"Regressão no BTC: beta {num(al.get('beta'))}, t do alfa {num(al.get('t_alpha'))}.",
         f"- **Estilo:** {st.get('opens', 0)} entradas em {st.get('coins_traded', 0)} moedas, posição média de "
@@ -127,6 +129,7 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
     L.append(f"- **Agora:** patrimônio em perps {usd(s.get('account_value_now'))}; último fill em "
              f"{day(s['last_fill']) if s.get('last_fill') else '–'}; posições abertas: "
              + (", ".join(f"{c} {'+' if v > 0 else ''}{v:g}" for c, v in list(pos.items())[:8]) or "nenhuma") + ".")
+    L += data_quality(s)
     if s.get("role") == "vault":
         L.append("- **É um vault:** dá para depositar nele direto, sem o atraso da cópia.")
     elif s.get("role") == "subAccount" and s.get("master"):
@@ -135,6 +138,24 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
         L.append("- **Pendências:** " + "; ".join(s["why"]) + ".")
     L.append("")
     return L
+
+
+def data_quality(s: dict) -> list[str]:
+    """How much of the wallet's book the fills explain."""
+    if not s.get("complete_to"):
+        return []
+    rc = s.get("recon") or {}
+    count = lambda n: f"{n or 0:,}".replace(",", ".")
+    small = lambda x: "–" if x is None or not np.isfinite(x) else f"{x * 100:.1f}%".replace(".", ",")
+    txt = (f"- **Dados:** fills completos de {day(s['coverage_start'])} a {day(s['complete_to'])} "
+           f"({count(s.get('n_fills'))} fills, {count(s.get('n_twap'))} de TWAP); posição mudando sem fill visível: "
+           f"{small(s.get('jump_share'))} do volume; posições reconstruídas contra a conta: diferença de "
+           f"{usd(abs(rc.get('gap_usd') or 0.0)).lstrip('+')} ({small(rc.get('share'))} do nocional)")
+    pc = s.get("pnl_check_oos")
+    if pc:
+        txt += (f"; PnL da cópia imediata no teste {usd(pc['sim'])}, PnL de perps da conta no mesmo período "
+                f"{usd(pc['real'])}")
+    return [txt + "."]
 
 
 def btc_change(data_dir: str, start_ms: int, end_ms: int) -> float | None:
@@ -296,8 +317,10 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
           "Hyperliquid, e Hyperliquid nas últimas horas). Moedas sem Binance (HIP-3 e as exclusivas da Hyperliquid) "
           "usam velas de 15 min nos últimos 52 dias e de 1 h antes disso: o atraso efetivo fica maior (mais conservador).",
           "- Spread e impacto são estimados pela liquidez de hoje, não a da época. Copiadores grandes pagam mais.",
-          "- Posições em HIP-3 abertas antes do período de fills e nunca mexidas não aparecem (o estado aberto só é lido "
-          "da bolsa principal). Ordens TWAP antigas podem faltar; o salto de posição é aplicado no fill seguinte.",
+          "- A API serve só a parte mais recente dos fills (de horas a anos, conforme a carteira) e as fatias de TWAP "
+          "das últimas semanas. Uma carteira sai como dados insuficientes se os fills não cobrem o teste até o fim, se "
+          "a posição muda sem fill visível em mais de 2% do volume, ou se as posições reconstruídas não batem com as "
+          "da conta (todas as dex, inclusive HIP-3).",
           "- Fora da amostra não quer dizer futuro: um trader pode mudar de estilo ou parar. Acompanhe com `track`.",
           "- Nada aqui é recomendação de investimento.", ""]
     path = os.path.join(out, "RELATORIO.md")

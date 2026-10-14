@@ -49,41 +49,60 @@ def prepare_fills(rows: list[dict]) -> pd.DataFrame:
     return df.sort_values("time", kind="mergesort").reset_index(drop=True)
 
 
+def fill_groups(g: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fills of one coin taken together per timestamp: (time, position before,
+    position after, price of the first fill) of each group.
+
+    The group starts at the one `startPosition` that is not another fill's
+    end (the API order inside a millisecond is not guaranteed) and ends at
+    that plus the group's size."""
+    t = g["time"].to_numpy(np.int64)
+    s = g["startPosition"].to_numpy(float)
+    q = g["q"].to_numpy(float)
+    px = g["px"].to_numpy(float)
+    cut = np.r_[0, np.flatnonzero(t[1:] != t[:-1]) + 1, len(t)]
+    times = t[cut[:-1]]
+    start, end = np.empty(len(times)), np.empty(len(times))
+    for k in range(len(times)):
+        a, b = cut[k], cut[k + 1]
+        if b - a == 1:
+            start[k] = s[a]
+        else:
+            ends = set(np.round(s[a:b] + q[a:b], 9))
+            cands = [x for x in s[a:b] if round(x, 9) not in ends]
+            start[k] = cands[0] if cands else s[a]
+        end[k] = start[k] + q[a:b].sum()
+    return times, start, end, px[cut[:-1]]
+
+
 def position_events(fills: pd.DataFrame) -> dict:
     """Per coin: (times, position after each time, position before the first).
 
-    Fills that share a timestamp are taken together: the group starts at the
-    one `startPosition` that is not another fill's end (the API order inside
-    a millisecond is not guaranteed) and ends at that plus the group's size.
-    If a group starts from a size different from where the previous one
-    ended (a TWAP slice or any fill the API no longer serves), the jump is
-    booked at that group's time, so the follower learns about it late, never
-    early.
+    If a group of fills starts from a size different from where the previous
+    one ended (a TWAP slice or any fill the API no longer serves), the jump
+    is booked at that group's time: the follower learns about it late. See
+    `position_jumps` for how much of the book moves that way.
     """
     out = {}
     for coin, g in fills.groupby("coin", sort=False):
-        t = g["time"].to_numpy(np.int64)
-        s = g["startPosition"].to_numpy(float)
-        q = g["q"].to_numpy(float)
-        cut = np.r_[0, np.flatnonzero(t[1:] != t[:-1]) + 1, len(t)]
-        times = t[cut[:-1]]
-        pos = np.empty(len(times))
-        first = None
-        for k in range(len(times)):
-            a, b = cut[k], cut[k + 1]
-            if b - a == 1:
-                start = s[a]
-            else:
-                ends = set(np.round(s[a:b] + q[a:b], 9))
-                cands = [x for x in s[a:b] if round(x, 9) not in ends]
-                start = cands[0] if cands else s[a]
-            if first is None:
-                first = start
-            cur = start + q[a:b].sum()  # after a gap the exchange's startPosition wins
-            pos[k] = cur
-        pos = np.where(np.abs(pos) < 1e-10, 0.0, pos)
-        out[coin] = (times, pos, float(first))
+        times, start, end, _ = fill_groups(g)  # after a gap the exchange's startPosition wins
+        pos = np.where(np.abs(end) < 1e-10, 0.0, end)
+        out[coin] = (times, pos, float(start[0]))
     return out
+
+
+def position_jumps(fills: pd.DataFrame, rel_tol: float = 1e-7) -> pd.DataFrame:
+    """Position changes with no visible fill: where a group of fills starts
+    from a size different from where the previous group of the coin ended.
+    Columns: coin, time, size (signed jump), px (price of the group)."""
+    rows = []
+    for coin, g in fills.groupby("coin", sort=False):
+        times, start, end, px = fill_groups(g)
+        jump = start[1:] - end[:-1]
+        big = np.abs(jump) > rel_tol * np.maximum(1.0, np.abs(start[1:]))
+        for t, j, p in zip(times[1:][big], jump[big], px[1:][big]):
+            rows.append({"coin": coin, "time": int(t), "size": float(j), "px": float(p)})
+    return pd.DataFrame(rows, columns=["coin", "time", "size", "px"])
 
 
 @dataclass
@@ -146,16 +165,20 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
 
     Returns are PnL over the wallet's account value at the start of the day
     (a follower who sizes in proportion to the wallet's equity), with the
-    capital floored at gross exposure (start or end of the day, whichever is
-    larger) / `max_leverage`, so that a stale or tiny equity reading cannot
-    blow up a return, and a follower never runs more than `max_leverage`.
+    capital floored at the day's peak gross exposure / `max_leverage`, so
+    that a stale or tiny equity reading cannot blow up a return, and a
+    follower never runs more than `max_leverage`. The peak is taken at the
+    start and end of the day and around every order of the follower, coin by
+    coin (their sum bounds the true peak from above, so trades opened and
+    closed inside one day count too). A follower cannot lose more than its
+    capital: a day's return is at least -100%.
     """
     cost_bps = cost_bps or {}
     funding = funding or {}
     day0 = (start_ms // DAY_MS) * DAY_MS
     days = np.arange(day0, end_ms, DAY_MS, dtype=np.int64)  # days that start before the end
     hours = np.arange(((start_ms + HOUR_MS - 1) // HOUR_MS) * HOUR_MS, end_ms, HOUR_MS, dtype=np.int64)
-    cols = {k: np.zeros(len(days)) for k in ("price", "fees", "funding", "gross")}
+    cols = {k: np.zeros(len(days)) for k in ("price", "fees", "funding", "gross", "gross_peak")}
     per_coin, all_trades, H_expo, H_ret, H_pos = [], [], {}, {}, {}
     for coin, ev in events.items():
         o = oracles.get(coin)
@@ -167,7 +190,7 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
         if np.isnan(C).all():
             continue
         # positions at the end of each day and trades inside each day
-        di = np.searchsorted(days, tr["t_exec"].to_numpy(np.int64), side="right") - 1
+        di = np.minimum(np.searchsorted(days, tr["t_exec"].to_numpy(np.int64), side="right") - 1, len(days) - 1)
         q = tr["q"].to_numpy(float)
         px = tr["px"].to_numpy(float)
         dq = np.bincount(di, weights=q, minlength=len(days))
@@ -201,6 +224,11 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
         cols["fees"] -= fee
         cols["funding"] += fund
         cols["gross"] += np.abs(eod) * C
+        if len(q):
+            held = np.cumsum(q)
+            peak = np.zeros(len(days))
+            np.maximum.at(peak, di, np.maximum(np.abs(held), np.abs(held - q)) * px)
+            cols["gross_peak"] += peak
         n_open = int(((np.abs(np.r_[0.0, np.cumsum(q)[:-1]]) < EPS) & (np.abs(np.cumsum(q)) > EPS)).sum()) if len(q) else 0
         per_coin.append({"coin": coin, "price": float(price_pnl.sum()), "fees": float(-fee.sum()),
                          "funding": float(fund.sum()), "orders": len(tr), "opens": n_open,
@@ -213,11 +241,12 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
     eq = equity_on(equity, days.astype(float))
     g = daily["gross"].to_numpy()
     gross_prev = np.r_[g[0], g[:-1]]
-    cap = np.fmax(eq, np.maximum(gross_prev, g) / max_leverage)
+    cap = np.fmax(eq, np.maximum.reduce([gross_prev, g, daily["gross_peak"].to_numpy()]) / max_leverage)
     cap = np.where(np.isnan(cap) | (cap < 1.0), np.nan, cap)
     daily["equity"] = eq
     daily["capital"] = cap
-    daily["ret"] = np.where(np.isnan(cap), 0.0, daily["pnl"] / np.where(np.isnan(cap), 1.0, cap))
+    ret = np.where(np.isnan(cap), 0.0, daily["pnl"] / np.where(np.isnan(cap), 1.0, cap))
+    daily["ret"] = np.maximum(ret, -1.0)
     daily.index = pd.to_datetime(daily.index, unit="ms")
     by_coin = pd.DataFrame(per_coin)
     if len(by_coin):

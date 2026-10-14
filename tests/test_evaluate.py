@@ -10,7 +10,7 @@ def summary(ret=0.5, p=0.001, ret60=0.4, ret120=0.3, shift_p=0.01, alpha_t=1.0, 
     s = {"address": "0xabc", "coverage_start": NOW - 300 * D, "oos_start": NOW - days * D,
          "oos_days": days, "last_fill": last_fill, "style": {"opens": opens},
          "shift": {"p": shift_p}, "alpha": {"t_alpha": alpha_t}}
-    s["oos_30"] = {"days": days, "ret_ann": ret, "p": p, "pnl_ex_top5": ex_top5}
+    s["oos_30"] = {"days": days, "ret_ann": ret, "p": p, "pnl_ex_top5": ex_top5, "ret_comp": ret / 3, "pnl": 1000.0}
     s["oos_60"] = {"days": days, "ret_ann": ret60}
     s["oos_120"] = {"days": days, "ret_ann": ret120}
     return s
@@ -73,3 +73,31 @@ def test_wallet_idle_before_split_stays_in_family():
     idle["is_30"] = {"days": 30, "active_days": 0, "ret_ann": 0.0}
     table = finalize([idle], CFG).set_index("address")
     assert table.loc["0xabc", "in_family"]
+
+
+def test_mean_up_but_follower_down_is_not_approved():
+    s = summary()
+    s["oos_30"]["ret_comp"] = -0.05  # positive mean of daily returns, but the compounded copy lost
+    v, why = classify(s, CFG, q=0.02)
+    assert v == "reprovada" and any("composto" in w for w in why)
+
+
+def test_ruined_copy_is_not_approved():
+    s = summary()
+    s["oos_30"]["ruined"] = True
+    v, why = classify(s, CFG, q=0.02)
+    assert v == "reprovada" and any("todo o capital" in w for w in why)
+
+
+def test_follower_path_stops_at_ruin():
+    from hlwf.evaluate import follower_path
+    assert follower_path([0.1, -3.0, 0.5, 0.2]).tolist() == [0.1, -1.0, 0.0, 0.0]
+    assert follower_path([0.1, -0.5]).tolist() == [0.1, -0.5]
+
+
+def test_stamp_changes_with_settings_and_end():
+    from hlwf.pipeline import run_stamp
+    a = run_stamp(CFG)
+    assert a == run_stamp(Settings(split_ms=NOW - 120 * D, end_ms=NOW))
+    assert a["settings_hash"] != run_stamp(Settings(split_ms=NOW - 120 * D, end_ms=NOW + 1))["settings_hash"]
+    assert a["settings_hash"] != run_stamp(Settings(split_ms=NOW - 120 * D, end_ms=NOW, insample_days=90))["settings_hash"]

@@ -137,3 +137,27 @@ def test_position_without_fills_is_held_all_window():
     entry = ((T0 + H + BAR - 1) // BAR) * BAR
     last_close = o.daily_close().reindex([T0 + 2 * D]).iloc[0]
     assert res.daily["pnl"].sum() == pytest.approx(2 * (last_close - o.price(entry)))
+
+
+def test_daily_return_is_at_least_minus_100pct():
+    # tiny equity and a losing round trip inside one day
+    t = T0 + 2 * H
+    res = run([fill(t, "BTC", "B", 10, 0), fill(t + 6 * H, "BTC", "A", 10, 10)], 0, end=T0 + 3 * D,
+              equity=pd.Series([20.0], index=[T0]), oracle=LinearOracle(slope=-1.0))
+    assert res.daily["ret"].min() >= -1.0
+
+
+def test_round_trip_inside_a_day_counts_in_the_capital_floor():
+    # end-of-day gross is zero, but the follower held ~200 of notional for six hours
+    t = T0 + 2 * H
+    res = run([fill(t, "BTC", "B", 2, 0), fill(t + 6 * H, "BTC", "A", 2, 2)], 0, equity=pd.Series([1.0], index=[T0]))
+    day0 = res.daily.iloc[0]
+    assert day0["gross"] == 0.0 and day0["capital"] >= 2 * 100 / 20
+
+
+def test_position_jumps_are_listed():
+    from hlwf.copysim import position_jumps
+    # the second fill starts at 3: two units moved without a visible fill
+    j = position_jumps(prepare_fills([fill(T0 + H, "BTC", "B", 1, 0), fill(T0 + 10 * H, "BTC", "B", 1, 3)]))
+    assert len(j) == 1 and j["size"].iloc[0] == pytest.approx(2.0) and j["time"].iloc[0] == T0 + 10 * H
+    assert position_jumps(prepare_fills([fill(T0 + H, "BTC", "B", 1, 0), fill(T0 + 2 * H, "BTC", "B", 1, 1)])).empty

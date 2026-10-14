@@ -31,7 +31,8 @@ def _cfg_kw(a) -> dict:
 def cmd_scan(a):
     from .pipeline import run_scan
     path = run_scan(a.data_dir, a.out, split_days=a.split_days, top=a.top, min_volume=a.min_volume,
-                    leaky=a.leaky, budget=a.budget, fetch_missing=a.fetch_missing, cfg_kw=_cfg_kw(a))
+                    leaky=a.leaky, budget=a.budget, fetch_missing=a.fetch_missing, cfg_kw=_cfg_kw(a),
+                    resume=not a.no_resume)
     print(f"report: {path}")
 
 
@@ -135,6 +136,8 @@ def main(argv=None):
     p.add_argument("--min-volume", type=float, default=50e6)
     p.add_argument("--leaky", action="store_true")
     p.add_argument("--fetch-missing", action="store_true", help="download missing weekly histories first")
+    p.add_argument("--no-resume", action="store_true",
+                   help="start over instead of resuming an interrupted scan of the same day")
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("wallet", help="test specific wallets")

@@ -13,9 +13,9 @@ import pandas as pd
 
 from . import stats
 from .api import InfoClient
-from .copysim import HOUR_MS, position_events, prepare_fills, simulate
+from .copysim import HOUR_MS, _wallet_pos_at, position_events, position_jumps, prepare_fills, simulate
 from .market import Market
-from .wallet import equity_series, fetch_wallet, open_positions
+from .wallet import all_open_positions, equity_series, fetch_wallet, perp_pnl_series
 
 DAY_MS = 86_400_000
 BASE_FUNDING = 0.0000125  # Hyperliquid's hourly interest component (~11% a year, longs pay)
@@ -41,12 +41,25 @@ class Settings:
     skill_alpha_t: float = 2.0
     robust_delays_min: tuple = (60, 120)
     insample_screen: bool = True
+    max_jump_share: float = 0.02   # position moved without visible fills, over the notional traded
+    max_recon_share: float = 0.10  # rebuilt end positions vs the account, over the book's notional
     extra: dict = field(default_factory=dict)
+
+
+def follower_path(ret) -> np.ndarray:
+    """Daily returns of a follower who starts on the first day: a day that
+    takes all of its capital (-100%) ends the copy, and the days after it are 0."""
+    r = np.maximum(np.asarray(ret, float), -1.0)
+    hit = np.flatnonzero(r <= -1.0)
+    if len(hit):
+        r = r.copy()
+        r[hit[0] + 1:] = 0.0
+    return r
 
 
 def slice_stats(daily: pd.DataFrame, start_ms: int, end_ms: int) -> dict:
     d = daily[(daily.index >= pd.Timestamp(start_ms, unit="ms").floor("D")) & (daily.index <= pd.Timestamp(end_ms, unit="ms"))]
-    r = d["ret"].to_numpy(float)
+    r = follower_path(d["ret"].to_numpy(float))
     n = len(r)
     if n < 2:
         return {"days": n}
@@ -56,6 +69,7 @@ def slice_stats(daily: pd.DataFrame, start_ms: int, end_ms: int) -> dict:
     return {
         "days": n, "active_days": active, "pnl": float(d["pnl"].sum()), "price": float(d["price"].sum()), "fees": float(d["fees"].sum()),
         "funding": float(d["funding"].sum()), "ret_sum": float(r.sum()), "ret_ann": float(r.mean() * 365),
+        "ret_comp": float(np.prod(1.0 + r) - 1.0), "ruined": bool((r <= -1.0).any()),
         "vol_ann": float(r.std(ddof=1) * np.sqrt(365)), "sharpe_ann": float(stats.sharpe(r) * np.sqrt(365)),
         "t": t, "p": p, "maxdd": stats.max_drawdown(r), "psr": stats.psr(r),
         "top5_share": conc["top_k_share"], "pnl_ex_top5": conc["ex_top_k"],
@@ -80,28 +94,85 @@ def style(res, start_ms: int) -> dict:
             "time_in_market": float(on.any(axis=1).mean())}
 
 
+def jump_share(fills: pd.DataFrame, start_ms: int, end_ms: int) -> float:
+    """Notional of the position changes with no visible fill, over the
+    notional of the fills, inside [start_ms, end_ms]."""
+    f = fills[(fills["time"] >= start_ms) & (fills["time"] <= end_ms)]
+    j = position_jumps(fills)
+    j = j[(j["time"] >= start_ms) & (j["time"] <= end_ms)]
+    jumped = float((j["size"].abs() * j["px"]).sum())
+    return jumped / max(float((f["q"].abs() * f["px"]).sum()), 1e-9) if jumped else 0.0
+
+
+def reconcile(events: dict, rec: dict, fills: pd.DataFrame) -> dict:
+    """Positions rebuilt from the fills against the account state of each dex,
+    at the time of that state. Coins of a dex whose state is unknown are skipped."""
+    main = rec.get("state") or {}
+    states = {"": main} if main else {}
+    states.update(rec.get("dex_states") or {})
+    checked = set(rec.get("dexes_checked") or []) | ({""} if main else set())
+    marks, actual = {}, {}
+    for st in states.values():
+        for p in st.get("assetPositions", []):
+            x = p.get("position") or {}
+            szi = float(x.get("szi") or 0)
+            if szi:
+                actual[x["coin"]] = szi
+                marks[x["coin"]] = abs(float(x.get("positionValue") or 0)) / abs(szi)
+    last_px = fills.groupby("coin")["px"].last().to_dict() if len(fills) else {}
+    gap, book, worst = 0.0, 0.0, []
+    for coin in set(events) | set(actual):
+        dex = coin.split(":")[0] if ":" in coin else ""
+        if dex not in checked:
+            continue
+        t_state = int((states.get(dex) or main).get("time") or rec.get("fetched_at") or 0)
+        times, pos, pos0 = events.get(coin, (np.array([], dtype=np.int64), np.array([]), 0.0))
+        mine = float(_wallet_pos_at(times, pos, pos0, np.array([t_state]))[0])
+        theirs = actual.get(coin, 0.0)
+        px = marks.get(coin) or float(last_px.get(coin, 0.0))
+        gap += abs(mine - theirs) * px
+        book += max(abs(mine), abs(theirs)) * px
+        if abs(mine - theirs) * px > 1.0:
+            worst.append({"coin": coin, "rebuilt": mine, "account": theirs, "gap_usd": abs(mine - theirs) * px})
+    worst.sort(key=lambda x: -x["gap_usd"])
+    return {"gap_usd": gap, "book_usd": book, "coins": worst[:5]}
+
+
+def pnl_check(ref_stats: dict | None, real: pd.Series, start_ms: int, end_ms: int) -> dict | None:
+    """Immediate copy (no costs) against the wallet's own perp PnL in the same
+    window: a diagnostic of the rebuilt book, not a test."""
+    if not ref_stats or real.empty or ref_stats.get("days", 0) < 2:
+        return None
+    t = np.array([pd.Timestamp(start_ms, unit="ms").floor("D").value // 1_000_000, end_ms], float)
+    a, b = np.interp(t, real.index.to_numpy(float), real.to_numpy(float))
+    sim, act = float(ref_stats["pnl"]), float(b - a)
+    return {"sim": sim, "real": act, "rel": abs(sim - act) / max(abs(sim), abs(act), 1.0)}
+
+
 def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient, data_dir: str = "data",
                     verbose: bool = False) -> tuple[dict, dict]:
     addr = addr.lower()
     want_from = cfg.split_ms - cfg.insample_days * DAY_MS
     # fills must start before the split plus room for `min_oos_days` of test
     need_from = cfg.end_ms - cfg.min_oos_days * DAY_MS
-    rec = fetch_wallet(client, addr, want_from, data_dir, need_from=need_from)
-    fills = prepare_fills(rec["fills"])
+    rec = fetch_wallet(client, addr, want_from, data_dir, need_from=need_from, need_to=cfg.end_ms)
+    cov = int(rec["coverage"])
+    # a fill older than the coverage may sit before a hole: the position at
+    # the coverage start comes from the startPosition of the first fill after it
+    fills = prepare_fills([f for f in rec["fills"] if f["time"] >= cov])
     events = position_events(fills)
-    # a position held through the whole window has no fill in it: take it from the open positions
-    for coin, szi in open_positions(rec.get("state")).items():
-        if coin not in events:
-            events[coin] = (np.array([], dtype=np.int64), np.array([]), float(szi))
-    cov = max(int(rec["coverage"]), int(rec["asked_from"]))
-    eval_start = cov
+    pos_now = all_open_positions(rec)
+    eval_start = max(cov, want_from)
     oos_start = max(cfg.split_ms, eval_start)
-    last_fill = int(fills["time"].max()) if len(fills) else None
-    out = {"address": addr, "coverage_start": cov, "oos_start": oos_start, "n_fills": int(len(fills)),
-           "last_fill": last_fill, "coins": sorted(events)}
+    seen = fills[fills["time"] <= cfg.end_ms]
+    last_fill = int(seen["time"].max()) if len(seen) else None
+    out = {"address": addr, "coverage_start": cov, "complete_to": int(rec["complete_to"]), "eval_start": eval_start,
+           "oos_start": oos_start, "n_fills": int(len(fills)),
+           "n_twap": int(fills["twapId"].notna().sum()) if "twapId" in fills else 0,
+           "last_fill": last_fill, "coins": sorted(set(events) | set(pos_now))}
     art: dict = {}
     oos_days = (cfg.end_ms - oos_start) / DAY_MS
-    if not events:
+    if not events and not pos_now:
         out.update(status="reprovada", reason="sem operações em perps no período")
         return out, art
     if oos_days < cfg.min_oos_days:
@@ -111,6 +182,21 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
                    reason=f"período fora da amostra curto ({oos_days:.0f} dias, fills só desde "
                           f"{pd.Timestamp(cov, unit='ms'):%d/%m/%Y})")
         return out, art
+    if rec["complete_to"] < cfg.end_ms:
+        out.update(status="insuficiente", oos_days=float(oos_days),
+                   reason=f"fills incompletos (completos só até {pd.Timestamp(rec['complete_to'], unit='ms'):%d/%m/%Y})")
+        return out, art
+    out["jump_share"] = jump_share(fills, eval_start, cfg.end_ms)
+    if out["jump_share"] > cfg.max_jump_share:
+        out.update(status="insuficiente", oos_days=float(oos_days),
+                   reason=f"posição muda sem fills visíveis ({out['jump_share'] * 100:.0f}% do volume)")
+        return out, art
+    # with the fills complete, a position held now and never traded since the
+    # coverage start was open the whole window
+    for coin, szi in pos_now.items():
+        if coin not in events:
+            events[coin] = (np.array([], dtype=np.int64), np.array([]), float(szi))
+    out["recon"] = reconcile(events, rec, fills)
     eq = equity_series(data_dir, addr)
     oracles, costs = {}, {}
     for coin in events:
@@ -149,8 +235,12 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
         out[f"oos_{k}"] = slice_stats(res.daily, oos_start, cfg.end_ms)
         if oos_start - eval_start >= 14 * DAY_MS:
             out[f"is_{k}"] = slice_stats(res.daily, eval_start, oos_start - 1)
+    perp_pnl = perp_pnl_series(data_dir, addr)
+    out["pnl_check_is"] = pnl_check(out.get("is_ref"), perp_pnl, eval_start, oos_start - 1)
+    out["pnl_check_oos"] = pnl_check(out.get("oos_ref"), perp_pnl, oos_start, cfg.end_ms)
     r_main = results[cfg.main_delay_min]
     d = r_main.daily[r_main.daily.index >= pd.Timestamp(oos_start, unit="ms").floor("D")]
+    r_oos = follower_path(d["ret"].to_numpy(float))
     # skill: timing (shift test) and alpha over BTC
     he = r_main.hourly_expo[r_main.hourly_expo.index >= oos_start]
     hr = r_main.hourly_ret[r_main.hourly_ret.index >= oos_start]
@@ -158,19 +248,26 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
     btc = market.candles("BTC", "1d", eval_start - 3 * DAY_MS).set_index("t")["close"]
     btc_ret = btc / btc.shift(1) - 1
     btc_ret.index = pd.to_datetime(btc_ret.index, unit="ms")
-    out["alpha"] = stats.alpha_beta(d["ret"].to_numpy(float), btc_ret.reindex(d.index).to_numpy(float))
-    boot = stats.block_bootstrap(d["ret"].to_numpy(float), n_boot=2000, mean_block=5)
+    out["alpha"] = stats.alpha_beta(r_oos, btc_ret.reindex(d.index).to_numpy(float))
+    boot = stats.block_bootstrap(r_oos, n_boot=2000, mean_block=5)
     if len(boot):
         lo, hi = np.quantile(boot * 365, [0.05, 0.95])
         out["ret_ann_ci90"] = [float(lo), float(hi)]
     out["style"] = style(r_main, oos_start)
     out["by_coin"] = r_main.by_coin.to_dict("records") if len(r_main.by_coin) else []
-    pos_now = open_positions(rec.get("state"))
     acct = float(((rec.get("state") or {}).get("marginSummary") or {}).get("accountValue") or 0.0)
     out["account_value_now"] = acct
     out["open_positions"] = pos_now
     out["oos_days"] = float(oos_days)
     out["eff_delay_min"] = effective_delay(r_main, oos_start)
+    # the rebuilt book has to end where the account is
+    ref = results["ref"].daily
+    ref = ref[ref.index >= pd.Timestamp(eval_start, unit="ms").floor("D")]
+    rc = out["recon"]
+    rc["share"] = rc["gap_usd"] / max(rc["book_usd"], float(ref["gross"].mean()) if len(ref) else 0.0, 1.0)
+    if rc["share"] > cfg.max_recon_share:
+        out.update(status="insuficiente",
+                   reason=f"posições reconstruídas não batem com a conta ({rc['share'] * 100:.0f}% do nocional)")
     art["daily"] = {k: v.daily for k, v in results.items()}
     art["by_coin"] = r_main.by_coin
     return out, art
@@ -211,6 +308,11 @@ def classify(s: dict, cfg: Settings, q: float | None) -> tuple[str, list[str]]:
         return "dados insuficientes", [why]
     if not main.get("ret_ann", 0) > 0:
         fails.append(f"cópia com {cfg.main_delay_min} min perde dinheiro fora da amostra")
+    elif main.get("ruined"):
+        fails.append(f"cópia com {cfg.main_delay_min} min perderia todo o capital num dia")
+    elif not (main.get("ret_comp", 0) > 0 and main.get("pnl", 0) > 0):
+        # a positive mean of daily returns, but the follower ends with less money
+        fails.append(f"cópia com {cfg.main_delay_min} min perde dinheiro no retorno composto ou em US$")
     for d in cfg.robust_delays_min:
         x = s.get(f"oos_{d}") or {}
         if not x.get("ret_ann", 0) > 0:
@@ -231,7 +333,8 @@ def classify(s: dict, cfg: Settings, q: float | None) -> tuple[str, list[str]]:
                     + (" (segue com posições abertas)" if s.get("open_positions") else ""))
     if not fails:
         return ("aprovada" if not soft else "aprovada (inativa)"), soft
-    if main.get("p", 1) <= 0.05 and main.get("ret_ann", 0) > 0 and (s.get("oos_60") or {}).get("ret_ann", 0) > 0:
+    if (main.get("p", 1) <= 0.05 and main.get("ret_ann", 0) > 0 and (s.get("oos_60") or {}).get("ret_ann", 0) > 0
+            and main.get("ret_comp", 0) > 0 and main.get("pnl", 0) > 0 and not main.get("ruined")):
         return "promissora", fails + soft
     return "reprovada", fails + soft
 
