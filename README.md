@@ -53,15 +53,19 @@ O endpoint `portfolio` traz o PnL e o patrimônio de perps desde mai/2024, em po
 
 ### Etapa C: cópia com atraso, testada fora da amostra
 
-Para cada carteira escolhida, baixa os fills de perps (inclusive HIP-3) desde 90 dias antes do corte e simula um copiador:
+Para cada carteira escolhida, baixa os fills de perps (inclusive HIP-3) desde 30 dias antes do corte e simula um copiador:
 
 - **Posição:** reconstruída pela cadeia `startPosition` dos fills. Fills do mesmo milissegundo são somados sem depender da ordem da API; um salto sem fill visível (TWAP antiga, fill que a API não serve mais) entra no fill seguinte, ou seja, o copiador fica sabendo tarde, nunca cedo. Posições abertas o período todo, sem fill, vêm do estado atual da conta.
-- **Execução:** cada mudança de posição vira uma ordem a mercado do copiador, enviada `atraso` depois do fill e executada na abertura da primeira vela de 5 min que começa depois disso (o atraso efetivo fica entre 30 e 35 min). Fills na mesma vela se compensam, como num copiador que consulta a conta periodicamente. Ao começar, o copiador entra nas posições que a carteira já tinha.
-- **Preços:** velas de 5 min da Hyperliquid (últimos 17 dias); antes disso, velas de 5 min da Binance, aceitas só se o fechamento diário bater com o da Hyperliquid (com conversão de unidades `kPEPE` → `1000PEPEUSDT`); para moedas sem Binance, velas de 15 min, 1 h ou 4 h da Hyperliquid (atraso efetivo maior). **O preço do fill da carteira nunca é usado**: quem opera a preços que ninguém mais consegue (livros ilíquidos, prints fora do mercado, como a `0x8bae` do Hyperliquid_RE) não ganha crédito por isso.
+- **Execução:** cada mudança de posição vira uma ordem a mercado do copiador, enviada `atraso` depois do fill e executada na abertura da primeira vela que começa depois disso (com velas de 5 min, o atraso efetivo fica entre 30 e 35 min). Fills na mesma vela se compensam, como num copiador que consulta a conta periodicamente. Ao começar, o copiador entra nas posições que a carteira já tinha.
+- **Preços:** velas de 5 min da Binance até ontem e da Hyperliquid nas últimas horas; as da Binance só são aceitas se o fechamento diário bater com o da Hyperliquid (com conversão de unidades `kPEPE` → `1000PEPEUSDT`; nome igual de token diferente é rejeitado); para moedas sem Binance (HIP-3 e as exclusivas da Hyperliquid), velas de 15 min da Hyperliquid nos últimos 52 dias e de 1 h antes disso (atraso efetivo de até 45 min ou 90 min: mais conservador). **O preço do fill da carteira nunca é usado**: quem opera a preços que ninguém mais consegue (livros ilíquidos, prints fora do mercado, como a `0x8bae` do Hyperliquid_RE) não ganha crédito por isso.
 - **Custos:** taxa *taker* de 4,5 bp (nível 0, sem desconto; HIP-3 com 2x) mais meio spread e impacto por faixa de liquidez de hoje (1 bp acima de US$ 1B/dia até 25 bp abaixo de US$ 2M/dia, ou o *impact spread* da bolsa, o que for maior). Funding horário real para as moedas com ≥ 1% da exposição; para as demais, a taxa base de 0,00125%/h.
 - **Retorno:** PnL diário (marcado no fechamento UTC) sobre o patrimônio da carteira no início do dia, como quem copia na mesma proporção do patrimônio. O patrimônio é o maior entre o total e o de perps (com margem unificada, o de perps sozinho pode ser quase zero) e nunca menor que a exposição bruta / 20 (teto de alavancagem do copiador).
 
 Atrasos simulados: imediato sem custos (referência), 30 min, 1 h, 2 h e 4 h.
+
+### A família do teste final
+
+Antes de olhar o período de teste, uma última triagem com dados de antes do corte: a cópia com 30 min, com custos, nos 30 dias anteriores ao corte (`--insample-days`) não pode ter dado prejuízo. Quem já perdia copiando antes do corte não entra na família de testes. Isso não usa nada do período de teste, então os valores-p continuam válidos, e a correção para múltiplos testes não gasta poder com carteiras que já não se copiavam bem (market makers, *hedges* de uma perna só, quem opera a preços fora do mercado). Carteiras da família sem dados suficientes no teste contam como p = 1.
 
 ### Os testes
 
@@ -70,7 +74,7 @@ Todos sobre os retornos diários **depois do corte**, com custos:
 | critério | teste | por quê |
 |---|---|---|
 | lucro com 30 min de atraso | t do retorno médio diário com erro padrão de Newey-West (HAC); p unilateral | retornos de quem carrega posição são autocorrelacionados; o t comum superestima a confiança |
-| não é sorte entre muitas | q de **Benjamini-Hochberg** ≤ 0,10 sobre todas as carteiras da etapa C (as sem dados contam como p = 1) | controla a fração de falsas descobertas entre as aprovadas |
+| não é sorte entre muitas | q de **Benjamini-Hochberg** ≤ 0,10 sobre a família do teste final (as sem dados contam como p = 1) | controla a fração de falsas descobertas entre as aprovadas |
 | sobrevive a atrasos maiores | retorno positivo também com 1 h e 2 h | a vantagem não pode depender de copiar no minuto exato |
 | é habilidade, não só direção do mercado | **teste de deslocamento**: as mesmas exposições horárias, deslocadas no tempo (≥ 7 dias, circular), formam a distribuição nula; p ≤ 0,10. Alternativa: alfa sobre o BTC com t ≥ 2 | quem ficou comprado numa alta ganha, mas o lucro vem do mercado. O deslocamento mantém o viés comprado/vendido, o tamanho e o tempo de cada posição; só muda *quando* |
 | não depende de poucos dias | lucro positivo sem os 5 melhores dias | um único trade de sorte não é estratégia |

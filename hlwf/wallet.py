@@ -28,7 +28,8 @@ def wallet_dir(data_dir: str, addr: str) -> str:
     return os.path.join(data_dir, "wallets", addr.lower())
 
 
-def fetch_wallet(c: InfoClient, addr: str, start_ms: int, data_dir: str = "data", max_age_h: float = 6.0) -> dict:
+def fetch_wallet(c: InfoClient, addr: str, start_ms: int, data_dir: str = "data", max_age_h: float = 6.0,
+                 need_from: int | None = None) -> dict:
     """Fills from `start_ms` (or the oldest the API still has) to now, plus
     the current clearinghouse state. Returns the cached record, where
     `coverage` is the time from which the fills are complete."""
@@ -50,8 +51,13 @@ def fetch_wallet(c: InfoClient, addr: str, start_ms: int, data_dir: str = "data"
         asked = rec["asked_from"]
         old = rec["fills"]
     else:
-        new = c.paginate_time(body, start_ms, now, key=fill_key, page_limit=2000)
-        cov = start_ms if len(new) < API_FILL_CAP - 500 else (new[0]["time"] if new else now)
+        # The first page holds the oldest fills the API still serves. If they
+        # start after `need_from`, the test period is not covered: stop there
+        # instead of downloading tens of thousands of fills for nothing.
+        cut = (lambda page: page[0]["time"] > need_from) if need_from else None
+        new = c.paginate_time(body, start_ms, now, key=fill_key, page_limit=2000, stop=cut)
+        truncated = bool(new) and cut is not None and len(new) == 2000 and new[0]["time"] > need_from
+        cov = start_ms if (len(new) < API_FILL_CAP - 500 and not truncated) else (new[0]["time"] if new else now)
         asked = start_ms
         old = rec["fills"] if rec else []
         if rec and new and rec["fetched_at"] >= cov:

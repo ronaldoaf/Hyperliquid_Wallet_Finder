@@ -25,7 +25,7 @@ BASE_FUNDING = 0.0000125  # Hyperliquid's hourly interest component (~11% a year
 class Settings:
     split_ms: int
     end_ms: int
-    insample_days: int = 90
+    insample_days: int = 30
     delays_min: tuple = (30, 60, 120, 240)
     main_delay_min: int = 30
     taker_bps: float = 4.5
@@ -35,11 +35,12 @@ class Settings:
     min_opens: int = 10
     min_active_days: int = 40
     inactive_after_days: int = 30
-    funding_min_share: float = 0.03
+    funding_min_share: float = 0.05
     q_max: float = 0.10
     skill_p_max: float = 0.10
     skill_alpha_t: float = 2.0
     robust_delays_min: tuple = (60, 120)
+    insample_screen: bool = True
     extra: dict = field(default_factory=dict)
 
 
@@ -83,7 +84,9 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
                     verbose: bool = False) -> tuple[dict, dict]:
     addr = addr.lower()
     want_from = cfg.split_ms - cfg.insample_days * DAY_MS
-    rec = fetch_wallet(client, addr, want_from, data_dir)
+    # fills must start before the split plus room for `min_oos_days` of test
+    need_from = cfg.end_ms - cfg.min_oos_days * DAY_MS
+    rec = fetch_wallet(client, addr, want_from, data_dir, need_from=need_from)
     fills = prepare_fills(rec["fills"])
     events = position_events(fills)
     # a position held through the whole window has no fill in it: take it from the open positions
@@ -100,6 +103,13 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
     oos_days = (cfg.end_ms - oos_start) / DAY_MS
     if not events:
         out.update(status="reprovada", reason="sem operações em perps no período")
+        return out, art
+    if oos_days < cfg.min_oos_days:
+        # the API no longer serves the fills of the test period: stop before
+        # spending requests on prices
+        out.update(status="insuficiente", oos_days=float(oos_days),
+                   reason=f"período fora da amostra curto ({oos_days:.0f} dias; fills só desde "
+                          f"{pd.Timestamp(cov, unit='ms'):%d/%m/%Y})")
         return out, art
     eq = equity_series(data_dir, addr)
     oracles, costs = {}, {}
@@ -177,7 +187,7 @@ def effective_delay(res, start_ms: int) -> float:
 def sample_problem(s: dict, cfg: Settings) -> str | None:
     """Why the wallet cannot be tested at all (None if it can)."""
     main = s.get(f"oos_{cfg.main_delay_min}") or {}
-    if s.get("status") in ("reprovada", "erro"):
+    if s.get("status") in ("reprovada", "erro", "insuficiente"):
         return s.get("reason", "")
     if s.get("oos_days", 0) < cfg.min_oos_days or main.get("days", 0) < cfg.min_oos_days:
         return (f"período fora da amostra curto ({s.get('oos_days', 0):.0f} dias; fills só desde "

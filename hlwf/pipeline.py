@@ -67,29 +67,57 @@ def evaluate_many(addrs, cfg: Settings, data_dir: str, client: InfoClient, tag: 
         out.append(s)
         if verbose:
             m = s.get(f"oos_{cfg.main_delay_min}") or {}
+            use = ", ".join(f"{k}={v}" for k, v in client.usage.most_common(4))
+            client.usage.clear()
             print(f"  [{i + 1}/{len(addrs)} {(time.time() - t0) / 60:.0f}min] {a} "
                   f"days={m.get('days', 0)} ret_ann={m.get('ret_ann', float('nan')):+.2f} "
-                  f"t={m.get('t', float('nan')):.2f} {s.get('status', '')}", flush=True)
+                  f"t={m.get('t', float('nan')):.2f} {s.get('status', '')} coins={len(s.get('coins', []))} "
+                  f"[{use}]", flush=True)
     return out
 
 
+def fails_insample(s: dict, cfg: Settings) -> bool:
+    """Pre-split screen: the delayed copy already lost money (after costs)
+    in the in-sample window. Uses no data after the split, so it can shrink
+    the family of tests without biasing the out-of-sample p-values. Wallets
+    with no in-sample fills are kept."""
+    if not cfg.insample_screen:
+        return False
+    x = s.get(f"is_{cfg.main_delay_min}") or {}
+    return x.get("days", 0) >= 14 and not x.get("ret_ann", 0) > 0
+
+
 def finalize(results: list[dict], cfg: Settings) -> pd.DataFrame:
-    """Benjamini-Hochberg across every wallet sent to stage C (a wallet that
-    could not be tested counts as p = 1), then the verdict of each."""
+    """Benjamini-Hochberg over the family of tests, then the verdict of each.
+
+    The family is every wallet sent to stage C except those whose copy was
+    already losing before the split. A wallet in the family that cannot be
+    tested (short coverage, few entries) counts as p = 1, which is
+    conservative."""
     k = cfg.main_delay_min
-    p = []
+    fam, p = [], []
     for s in results:
+        if s.get("status") == "erro" or fails_insample(s, cfg):
+            continue
         m = s.get(f"oos_{k}") or {}
         enough = sample_problem(s, cfg) is None
+        fam.append(s)
         p.append(m.get("p", 1.0) if enough and np.isfinite(m.get("p", np.nan)) else 1.0)
-    q = stats.bh_qvalues(p) if p else np.array([])
+    q = dict(zip(map(id, fam), stats.bh_qvalues(p))) if p else {}
+    pmap = dict(zip(map(id, fam), p))
     rows = []
-    for s, pi, qi in zip(results, p, q):
+    for s in results:
         if s.get("status") == "erro":
             verdict, why = "erro", [s.get("reason", "")]
+        elif id(s) not in q:
+            verdict = "reprovada"
+            why = [f"cópia com {k} min já perdia dinheiro antes do corte (fora da família testada)"]
         else:
-            verdict, why = classify(s, cfg, float(qi))
-        s["p_used"], s["q"], s["verdict"], s["why"] = float(pi), float(qi), verdict, why
+            verdict, why = classify(s, cfg, float(q[id(s)]))
+        s["p_used"] = float(pmap.get(id(s), np.nan))
+        s["q"] = float(q.get(id(s), np.nan))
+        s["in_family"] = id(s) in q
+        s["verdict"], s["why"] = verdict, why
         rows.append(flat_row(s, cfg))
     return pd.DataFrame(rows)
 
@@ -113,7 +141,8 @@ def flat_row(s: dict, cfg: Settings) -> dict:
     st = s.get("style") or {}
     bc = s.get("by_coin") or []
     row = {
-        "address": s["address"], "verdict": s.get("verdict"), "why": "; ".join(s.get("why") or []),
+        "address": s["address"], "verdict": s.get("verdict"), "in_family": s.get("in_family"),
+        "why": "; ".join(s.get("why") or []),
         "oos_days": round(s.get("oos_days", 0), 1), "active_days": m.get("active_days"), "ret_ann_30": m.get("ret_ann"), "sharpe_30": m.get("sharpe_ann"),
         "t_30": m.get("t"), "p_30": s.get("p_used"), "q": s.get("q"), "maxdd_30": m.get("maxdd"),
         "pnl_30": m.get("pnl"), "fees_30": m.get("fees"), "funding_30": m.get("funding"),
@@ -163,7 +192,8 @@ def run_scan(data_dir: str = "data", out_root: str = "reports", split_days: int 
     annotate_roles(client, results)
     funnel = {"leaderboard": len(lb), "stage_a": len(a), "stage_b_universe": len(universe),
               "stage_b_scored": int(b["ok"].sum()) if len(b) else 0, "stage_b_positive": len(ok),
-              "stage_c": len(sel), "min_volume": min_volume, "leaky": leaky, "top": top}
+              "stage_c": len(sel), "family": int(table["in_family"].sum()) if len(table) else 0,
+              "min_volume": min_volume, "leaky": leaky, "top": top}
     path = write_scan_report(out_root, data_dir, tag, cfg, funnel, b, table, results)
     save_json(os.path.join(run_dir(data_dir, tag), "_meta.json"),
               {"settings": settings_dict(cfg), "funnel": funnel, "generated_at": now})

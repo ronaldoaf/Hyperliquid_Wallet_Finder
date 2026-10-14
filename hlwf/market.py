@@ -262,13 +262,14 @@ class Market:
         if self.use_binance:
             bn = validate_against(self.binance_5m(coin, start_ms - DAY_MS, end_ms), daily)
         if bn is not None and len(bn):
+            # Binance covers up to yesterday: Hyperliquid 5m only for the last hours
             hl5 = self.candles(coin, "5m", int(bn["t"].iloc[-1]) - HOUR_MS)
-        else:
-            hl5 = self.candles(coin, "5m", start_ms)
-        if len(hl5):
-            layers.append(("hl5m", INTERVAL_MS["5m"], hl5))
-        if bn is not None and len(bn):
+            if len(hl5):
+                layers.append(("hl5m", INTERVAL_MS["5m"], hl5))
             layers.append(("binance5m", INTERVAL_MS["5m"], bn))
+        # No Binance (HIP-3, Hyperliquid-only coins): 15m for the last 52 days and
+        # 1h before that. The follower then trades up to one bar later than the
+        # nominal delay, which only makes the test harder to pass.
         firsts = [int(x["t"].iloc[0]) for _, _, x in layers if len(x)]
         covered = min(firsts) if firsts else end_ms
         for iv in ("15m", "1h", "4h"):

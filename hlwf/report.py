@@ -145,14 +145,16 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
         f"- **Funil:** {funnel['leaderboard']:,} carteiras no leaderboard → {funnel['stage_a']:,} com volume "
         f"≥ US$ {funnel['min_volume'] / 1e6:,.0f}M → {funnel['stage_b_universe']:,} com histórico baixado → "
         f"{funnel['stage_b_scored']:,} pontuáveis antes do corte → {funnel['stage_b_positive']:,} com retorno semanal "
-        f"positivo → **{funnel['stage_c']} testadas** (as de maior t semanal antes do corte).".replace(",", "."),
+        f"positivo → **{funnel['stage_c']} simuladas** (as de maior t semanal antes do corte) → "
+        f"**{funnel.get('family', funnel['stage_c'])} na família do teste final** (as que não perdiam dinheiro "
+        f"copiando com {cfg.main_delay_min} min nos {cfg.insample_days} dias antes do corte).".replace(",", "."),
         "- **Resultado:** " + ", ".join(f"{counts.get(v, 0)} {v}" for v in ORDER if counts.get(v, 0)) + ".",
         f"- **Custos do copiador:** taxa *taker* de {num(cfg.taker_bps, 1)} bp (HIP-3: {num(cfg.hip3_fee_mult, 0)}x) "
         "mais meio spread/impacto por faixa de liquidez (1–25 bp), funding horário real nas moedas relevantes; "
         f"alavancagem do copiador limitada a {cfg.max_leverage:.0f}x.",
         "",
         "Critérios para **aprovada** (todos fora da amostra, com custos): q de Benjamini-Hochberg ≤ "
-        f"{num(cfg.q_max)} para o retorno médio diário com {cfg.main_delay_min} min de atraso; retorno positivo também "
+        f"{num(cfg.q_max)} (sobre a família do teste final) para o retorno médio diário com {cfg.main_delay_min} min de atraso; retorno positivo também "
         f"com {', '.join(delay_label(d) for d in cfg.robust_delays_min)}; habilidade além da direção do mercado "
         f"(teste de deslocamento p ≤ {num(cfg.skill_p_max)} ou alfa sobre o BTC com t ≥ {num(cfg.skill_alpha_t, 1)}); "
         f"lucro positivo sem os 5 melhores dias; pelo menos {cfg.min_oos_days} dias e {cfg.min_opens} entradas no teste. "

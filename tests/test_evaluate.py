@@ -54,3 +54,14 @@ def test_finalize_counts_untestable_wallets_as_p1():
     assert row.loc["0xdef", "p_30"] == 1.0
     # two tests: q of the good one is p * 2 / 1
     assert row.loc["0xabc", "q"] == 0.002
+
+
+def test_insample_loser_leaves_the_family():
+    good = summary(p=0.001)
+    bad = summary(p=0.0001)
+    bad["address"] = "0xdef"
+    bad["is_30"] = {"days": 30, "ret_ann": -0.2}
+    table = finalize([good, bad], CFG).set_index("address")
+    assert not table.loc["0xdef", "in_family"] and table.loc["0xdef", "verdict"] == "reprovada"
+    # the family has one test, so q equals p
+    assert table.loc["0xabc", "q"] == 0.001

@@ -47,6 +47,7 @@ class InfoClient:
         self.spent: collections.deque = collections.deque()  # (time, weight)
         self.session = requests.Session()
         self.calls = 0
+        self.usage: collections.Counter = collections.Counter()  # weight spent per request type
 
     def _window(self) -> int:
         now = time.monotonic()
@@ -71,6 +72,7 @@ class InfoClient:
                 if r.status_code == 429:
                     # someone else on this IP, or the estimate was short: fill the window
                     self.spent.append((time.monotonic(), self.budget))
+                    self.usage["429"] += 1
                 if r.status_code == 429 or r.status_code >= 500:
                     raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:200]}")
                 r.raise_for_status()
@@ -80,6 +82,7 @@ class InfoClient:
                 ew = extra_weight(kind, n)
                 if ew:
                     self.spent.append((time.monotonic(), ew))
+                self.usage[kind] += w0 + ew
                 return out
             except (requests.RequestException, ValueError):
                 if attempt == retries - 1:
@@ -90,7 +93,8 @@ class InfoClient:
     def paginate_time(self, body: dict, start_ms: int, end_ms: int | None = None,
                       key: Callable[[dict], Any] = lambda x: (x.get("time"), x.get("hash"), str(x)),
                       time_of: Callable[[dict], int] = lambda x: int(x["time"]),
-                      page_limit: int = 500, max_pages: int | None = None) -> list[dict]:
+                      page_limit: int = 500, max_pages: int | None = None,
+                      stop: Callable[[list], bool] | None = None) -> list[dict]:
         """Walk forward over an endpoint that takes startTime/endTime and returns
         the oldest `page_limit` rows of the window. The next page starts at the
         last timestamp seen (rows sharing it across pages are deduplicated)."""
@@ -111,7 +115,7 @@ class InfoClient:
                     out.append(item)
                     new += 1
             last_t = max(time_of(x) for x in page)
-            if len(page) < page_limit or (max_pages and pages >= max_pages):
+            if len(page) < page_limit or (max_pages and pages >= max_pages) or (stop and stop(page)):
                 break
             cur = last_t + 1 if new == 0 else last_t
         out.sort(key=time_of)
