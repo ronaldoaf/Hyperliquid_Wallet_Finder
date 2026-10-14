@@ -23,6 +23,9 @@ python -m hlwf wallet 0xENDERECO1 0xENDERECO2
 
 # acompanhar uma seleção antiga daqui para frente (o teste fora da amostra de verdade)
 python -m hlwf track reports/varredura_2026-10-14/selecao.json
+
+# o que as carteiras selecionadas têm aberto agora e o que fizeram nas últimas 24 h
+python -m hlwf positions reports/varredura_2026-10-14/selecao.json --hours 24
 ```
 
 Opções úteis: `--main-delay-min 60` (atraso principal), `--taker-bps 3.0` (se você tem desconto de taxa), `--max-leverage 10` (teto de alavancagem do copiador), `--budget 1100` (peso de API por minuto; o limite por IP é 1200).
@@ -71,7 +74,7 @@ Todos sobre os retornos diários **depois do corte**, com custos:
 | sobrevive a atrasos maiores | retorno positivo também com 1 h e 2 h | a vantagem não pode depender de copiar no minuto exato |
 | é habilidade, não só direção do mercado | **teste de deslocamento**: as mesmas exposições horárias, deslocadas no tempo (≥ 7 dias, circular), formam a distribuição nula; p ≤ 0,10. Alternativa: alfa sobre o BTC com t ≥ 2 | quem ficou comprado numa alta ganha, mas o lucro vem do mercado. O deslocamento mantém o viés comprado/vendido, o tamanho e o tempo de cada posição; só muda *quando* |
 | não depende de poucos dias | lucro positivo sem os 5 melhores dias | um único trade de sorte não é estratégia |
-| amostra mínima | ≥ 60 dias de teste e ≥ 10 entradas | abaixo disso o teste não tem poder |
+| amostra mínima | ≥ 60 dias de teste, ≥ 40 dias com posição e ≥ 10 entradas | abaixo disso o teste não tem poder |
 
 **Aprovada** passa em tudo; **promissora** tem p < 0,05 sem correção e lucra com 30 e 60 min, mas falha em algum outro critério; **dados insuficientes** quando os fills não cobrem o período de teste (a API só guarda os 10 mil fills mais recentes) ou há poucas entradas.
 
