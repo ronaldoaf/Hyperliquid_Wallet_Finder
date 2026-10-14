@@ -26,6 +26,12 @@ def pct(x, nd=0) -> str:
     return f"{x * 100:+.{nd}f}%".replace(".", ",")
 
 
+def share(x) -> str:
+    if x is None or not np.isfinite(x):
+        return "–"
+    return f"{x * 100:.0f}%"
+
+
 def num(x, nd=2) -> str:
     if x is None or (isinstance(x, float) and not np.isfinite(x)):
         return "–"
@@ -35,6 +41,8 @@ def num(x, nd=2) -> str:
 def usd(x) -> str:
     if x is None or not np.isfinite(x):
         return "–"
+    if abs(x) < 0.5:
+        return "US$ 0"
     s = "−" if x < 0 else "+"
     v = abs(x)
     if v >= 1e6:
@@ -75,15 +83,17 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
     ci = s.get("ret_ann_ci90")
     L += [
         f"- **Teste fora da amostra** ({day(s['oos_start'])} → hoje, cópia com {cfg.main_delay_min} min, atraso efetivo médio de "
-        f"{num(s.get('eff_delay_min'), 0)} min): p = {num(s.get('p_used'), 4)}, q (BH) = {num(s.get('q'), 3)}"
+        f"{num(s.get('eff_delay_min'), 0)} min; posicionada em {m.get('active_days', '–')} dias): p = {num(s.get('p_used'), 4)}, q (BH) = {num(s.get('q'), 3)}"
         + (f"; intervalo de 90% do retorno a.a. (bootstrap em blocos): {pct(ci[0])} a {pct(ci[1])}" if ci else "") + ".",
         f"- **É habilidade ou mercado?** Teste de deslocamento (mesmas posições em outras datas): p = {num(sh.get('p'), 3)}. "
         f"Regressão no BTC: beta {num(al.get('beta'))}, t do alfa {num(al.get('t_alpha'))}.",
         f"- **Estilo:** {st.get('opens', 0)} entradas em {st.get('coins_traded', 0)} moedas, posição média de "
-        f"{num(st.get('hold_days'), 1)} dias, {pct(st.get('long_share'))} da exposição comprada, "
-        f"posicionado {pct(st.get('time_in_market'))} do tempo; alavancagem média {num(m.get('lev_avg'), 1)}x "
+        f"{num(st.get('hold_days'), 1)} dias, {share(st.get('long_share'))} da exposição comprada, "
+        f"posicionado {share(st.get('time_in_market'))} do tempo; alavancagem média {num(m.get('lev_avg'), 1)}x "
         f"(máx. {num(m.get('lev_max'), 1)}x).",
-        f"- **Concentração:** os 5 melhores dias somam {pct(m.get('top5_share'))} do PnL; sem eles, {usd(m.get('pnl_ex_top5'))}.",
+        (f"- **Concentração:** os 5 melhores dias somam {share(m.get('top5_share'))} do PnL; sem eles, "
+         f"{usd(m.get('pnl_ex_top5'))}." if (m.get("pnl") or 0) > 0 else
+         f"- **Concentração:** PnL total negativo; sem os 5 melhores dias, {usd(m.get('pnl_ex_top5'))}."),
     ]
     bc = s.get("by_coin") or []
     if bc:

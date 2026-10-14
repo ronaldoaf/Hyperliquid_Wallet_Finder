@@ -33,7 +33,8 @@ class Settings:
     max_leverage: float = 20.0
     min_oos_days: int = 60
     min_opens: int = 10
-    active_days: int = 30
+    min_active_days: int = 40
+    inactive_after_days: int = 30
     funding_min_share: float = 0.03
     q_max: float = 0.10
     skill_p_max: float = 0.10
@@ -50,8 +51,9 @@ def slice_stats(daily: pd.DataFrame, start_ms: int, end_ms: int) -> dict:
         return {"days": n}
     t, p = stats.hac_t(r)
     conc = stats.concentration(d["pnl"].to_numpy(float), 5)
+    active = int(((d["gross"] > 0) | (d["pnl"].abs() > 0)).sum())
     return {
-        "days": n, "pnl": float(d["pnl"].sum()), "price": float(d["price"].sum()), "fees": float(d["fees"].sum()),
+        "days": n, "active_days": active, "pnl": float(d["pnl"].sum()), "price": float(d["price"].sum()), "fees": float(d["fees"].sum()),
         "funding": float(d["funding"].sum()), "ret_sum": float(r.sum()), "ret_ann": float(r.mean() * 365),
         "vol_ann": float(r.std(ddof=1) * np.sqrt(365)), "sharpe_ann": float(stats.sharpe(r) * np.sqrt(365)),
         "t": t, "p": p, "maxdd": stats.max_drawdown(r), "psr": stats.psr(r),
@@ -172,18 +174,31 @@ def effective_delay(res, start_ms: int) -> float:
     return float(((tr["t_exec"] - tr["t_signal"]) / 60_000).mean()) if len(tr) else float("nan")
 
 
+def sample_problem(s: dict, cfg: Settings) -> str | None:
+    """Why the wallet cannot be tested at all (None if it can)."""
+    main = s.get(f"oos_{cfg.main_delay_min}") or {}
+    if s.get("status") in ("reprovada", "erro"):
+        return s.get("reason", "")
+    if s.get("oos_days", 0) < cfg.min_oos_days or main.get("days", 0) < cfg.min_oos_days:
+        return (f"período fora da amostra curto ({s.get('oos_days', 0):.0f} dias; fills só desde "
+                f"{pd.Timestamp(s['coverage_start'], unit='ms'):%d/%m/%Y})")
+    if main.get("active_days", cfg.min_active_days) < cfg.min_active_days:
+        return f"posicionada em poucos dias do teste ({main.get('active_days')})"
+    opens = (s.get("style") or {}).get("opens", 0)
+    if opens < cfg.min_opens:
+        return f"poucas entradas fora da amostra ({opens})"
+    return None
+
+
 def classify(s: dict, cfg: Settings, q: float | None) -> tuple[str, list[str]]:
     """Verdict and the list of criteria that failed (in Portuguese, for the report)."""
     main = s.get(f"oos_{cfg.main_delay_min}") or {}
     fails, soft = [], []
     if s.get("status") == "reprovada":
         return "reprovada", [s.get("reason", "")]
-    if s.get("oos_days", 0) < cfg.min_oos_days or main.get("days", 0) < cfg.min_oos_days:
-        return "dados insuficientes", [f"período fora da amostra curto ({s.get('oos_days', 0):.0f} dias; fills só desde "
-                                       f"{pd.Timestamp(s['coverage_start'], unit='ms'):%d/%m/%Y})"]
-    opens = (s.get("style") or {}).get("opens", 0)
-    if opens < cfg.min_opens:
-        return "dados insuficientes", [f"poucas entradas fora da amostra ({opens})"]
+    why = sample_problem(s, cfg)
+    if why:
+        return "dados insuficientes", [why]
     if not main.get("ret_ann", 0) > 0:
         fails.append(f"cópia com {cfg.main_delay_min} min perde dinheiro fora da amostra")
     for d in cfg.robust_delays_min:
@@ -201,7 +216,7 @@ def classify(s: dict, cfg: Settings, q: float | None) -> tuple[str, list[str]]:
     if not main.get("pnl_ex_top5", 0) > 0:
         fails.append("lucro depende dos 5 melhores dias")
     last = s.get("last_fill")
-    if last is None or (cfg.end_ms - last) > cfg.active_days * DAY_MS:
+    if last is None or (cfg.end_ms - last) > cfg.inactive_after_days * DAY_MS:
         soft.append("inativa nos últimos 30 dias")
     if not fails:
         return ("aprovada" if not soft else "aprovada (inativa)"), soft

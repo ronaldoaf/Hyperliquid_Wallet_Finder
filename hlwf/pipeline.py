@@ -12,7 +12,7 @@ import pandas as pd
 
 from . import stats
 from .api import InfoClient
-from .evaluate import Settings, classify, evaluate_wallet, settings_dict
+from .evaluate import Settings, classify, evaluate_wallet, sample_problem, settings_dict
 from .market import Market
 from .screen import fetch_portfolios, load_leaderboard, portfolio_path, stage_a, stage_b
 from .store import load_json, save_json
@@ -80,7 +80,7 @@ def finalize(results: list[dict], cfg: Settings) -> pd.DataFrame:
     p = []
     for s in results:
         m = s.get(f"oos_{k}") or {}
-        enough = s.get("oos_days", 0) >= cfg.min_oos_days and m.get("days", 0) >= cfg.min_oos_days
+        enough = sample_problem(s, cfg) is None
         p.append(m.get("p", 1.0) if enough and np.isfinite(m.get("p", np.nan)) else 1.0)
     q = stats.bh_qvalues(p) if p else np.array([])
     rows = []
@@ -114,7 +114,7 @@ def flat_row(s: dict, cfg: Settings) -> dict:
     bc = s.get("by_coin") or []
     row = {
         "address": s["address"], "verdict": s.get("verdict"), "why": "; ".join(s.get("why") or []),
-        "oos_days": round(s.get("oos_days", 0), 1), "ret_ann_30": m.get("ret_ann"), "sharpe_30": m.get("sharpe_ann"),
+        "oos_days": round(s.get("oos_days", 0), 1), "active_days": m.get("active_days"), "ret_ann_30": m.get("ret_ann"), "sharpe_30": m.get("sharpe_ann"),
         "t_30": m.get("t"), "p_30": s.get("p_used"), "q": s.get("q"), "maxdd_30": m.get("maxdd"),
         "pnl_30": m.get("pnl"), "fees_30": m.get("fees"), "funding_30": m.get("funding"),
         "lev_avg": m.get("lev_avg"), "pnl_ex_top5": m.get("pnl_ex_top5"),

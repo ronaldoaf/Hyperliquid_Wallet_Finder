@@ -69,6 +69,44 @@ def cmd_track(a):
     print(f"report: {path}")
 
 
+def cmd_positions(a):
+    """What the selected wallets hold now and what they did in the last hours."""
+    import json
+
+    import pandas as pd
+
+    addrs = []
+    for x in a.targets:
+        if x.endswith(".json"):
+            with open(x) as f:
+                addrs += [w["address"] for w in json.load(f)["wallets"]]
+        else:
+            addrs.append(x.lower())
+    c = InfoClient(budget=a.budget)
+    now = int(time.time() * 1000)
+    for addr in addrs:
+        st = c.post({"type": "clearinghouseState", "user": addr})
+        av = float(st["marginSummary"]["accountValue"])
+        print(f"\n## {addr}  (patrimônio em perps US$ {av:,.0f})")
+        rows = []
+        for p in st.get("assetPositions", []):
+            x = p["position"]
+            szi = float(x["szi"])
+            ntl = float(x["positionValue"])
+            rows.append({"moeda": x["coin"], "lado": "long" if szi > 0 else "short", "tamanho": abs(szi),
+                         "entrada": float(x["entryPx"]), "nocional": ntl, "alav": ntl / av if av else float("nan"),
+                         "PnL aberto": float(x["unrealizedPnl"]), "liquidação": x.get("liquidationPx")})
+        print(pd.DataFrame(rows).to_string(index=False) if rows else "sem posições abertas")
+        fills = c.post({"type": "userFillsByTime", "user": addr, "startTime": now - a.hours * 3_600_000,
+                        "aggregateByTime": True})
+        fills = [f for f in fills if not f["coin"].startswith("@") and "/" not in f["coin"]]
+        if fills:
+            df = pd.DataFrame(fills)
+            df["hora"] = pd.to_datetime(df["time"], unit="ms").dt.strftime("%d/%m %H:%M")
+            print(f"fills nas últimas {a.hours}h:")
+            print(df[["hora", "coin", "dir", "sz", "px"]].tail(15).to_string(index=False))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hlwf", description="Hyperliquid wallet finder")
     ap.add_argument("--data-dir", default="data")
@@ -108,6 +146,11 @@ def main(argv=None):
     common(p)
     p.add_argument("selection", help="reports/varredura_.../selecao.json")
     p.set_defaults(func=cmd_track)
+
+    p = sub.add_parser("positions", help="open positions and recent fills of selected wallets")
+    p.add_argument("targets", nargs="+", help="addresses or a selecao.json")
+    p.add_argument("--hours", type=int, default=24)
+    p.set_defaults(func=cmd_positions)
 
     a = ap.parse_args(argv)
     t0 = time.time()
