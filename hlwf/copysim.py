@@ -262,13 +262,15 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
         cols["funding"] += fund
         coin_pnl[coin] = price_pnl - fee + fund
         cols["gross"] += np.abs(eod) * C
+        peak = np.zeros(len(days))
         if len(q):
             held = np.cumsum(q)
-            peak = np.zeros(len(days))
             np.maximum.at(peak, di, np.maximum(np.abs(held), np.abs(held - q)) * px)
             cols["gross_peak"] += peak
-            # initial margin at the coin's maximum leverage (2 x its maintenance fraction)
-            cols["margin_peak"] += peak * 2.0 * (maint or {}).get(coin, 1.0 / (2.0 * max_leverage))
+        # initial margin at the coin's maximum leverage (2 x its maintenance
+        # fraction), for the largest position of the day: traded or just held
+        held_ntl = np.maximum(np.abs(sod), np.abs(eod)) * np.nan_to_num(C)
+        cols["margin_peak"] += np.maximum(peak, held_ntl) * 2.0 * (maint or {}).get(coin, 1.0 / (2.0 * max_leverage))
         n_open = int(((np.abs(np.r_[0.0, np.cumsum(q)[:-1]]) < EPS) & (np.abs(np.cumsum(q)) > EPS)).sum()) if len(q) else 0
         per_coin.append({"coin": coin, "price": float(price_pnl.sum()), "fees": float(-fee.sum()),
                          "funding": float(fund.sum()), "orders": len(tr), "opens": n_open,
