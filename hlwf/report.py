@@ -92,7 +92,8 @@ def delays(cfg: Settings) -> list:
 def criteria_text(cfg: Settings) -> str:
     """Every rule `classify` applies, written from the settings."""
     main = delay_label(cfg.main_delay_min)
-    rob = ", ".join(delay_label(d) for d in cfg.robust_delays_min)
+    rob = ", ".join(delay_label(d) for d in cfg.robust_delays_min) or main
+    first_rob = delay_label(cfg.robust_delays_min[0]) if cfg.robust_delays_min else main
     return (
         "Critérios para **aprovada** (todos fora da amostra, com custos): (1) dados suficientes: fills completos "
         f"no teste, pelo menos {cfg.min_oos_days} dias de teste, {cfg.min_active_days} dias posicionada e "
@@ -104,7 +105,7 @@ def criteria_text(cfg: Settings) -> str:
         f"teste final) para o retorno médio diário com {main}; (5) habilidade além da direção do mercado: teste "
         f"de deslocamento p ≤ {num(cfg.skill_p_max)} ou alfa sobre o BTC com t ≥ {num(cfg.skill_alpha_t, 1)}; "
         "(6) lucro positivo sem os 5 melhores dias. **Promissora:** dados suficientes, p < 0,05 sem correção e "
-        f"o copiador mais rico com {main} e com {delay_label(cfg.robust_delays_min[0])}, mas falha algum outro "
+        f"o copiador mais rico com {main} e com {first_rob}, mas falha algum outro "
         "critério.")
 
 

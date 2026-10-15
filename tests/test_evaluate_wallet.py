@@ -19,6 +19,13 @@ class WaveOracle:
 
     def __init__(self):
         self.t = np.arange(T0 - 60 * D, END + 2 * D, BAR, dtype=np.int64)
+        self.layers = [("fake", BAR, self.t, self.price(self.t))]
+        days = np.arange(T0 - 60 * D, END + D, D, dtype=np.int64)
+        self.daily = pd.DataFrame({"t": days, "open": 100.0, "close": self.price(days + D), "volume": 1e9})
+
+    def price_asof(self, T):
+        i = int(np.searchsorted(self.t, T, side="right")) - 1
+        return float(self.price(self.t[i])) if i >= 0 else float("nan")
 
     def price(self, t):
         return 100.0 + 10.0 * np.sin(np.asarray(t, float) / (3 * D))
@@ -36,11 +43,16 @@ class WaveOracle:
 
 
 class FakeMarket:
+    errors: set = set()
+
     def oracle(self, coin, start_ms, end_ms=None):
         return WaveOracle()
 
-    def cost_bps(self, coin, taker_bps=4.5, hip3_fee_mult=2.0):
+    def cost_bps(self, coin, taker_bps=4.5, hip3_fee_mult=2.0, window_ntl=None):
         return 5.0
+
+    def maintenance(self, coin, default_lev=20.0):
+        return 1.0 / (2 * default_lev)
 
     def funding(self, coin, start_ms, end_ms=None):
         return pd.Series(dtype=float)

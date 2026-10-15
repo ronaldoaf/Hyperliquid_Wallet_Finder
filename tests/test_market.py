@@ -55,3 +55,17 @@ def test_price_asof_never_uses_a_later_bar():
     o = PriceOracle("X", [("fine", 300_000, bars)], bars)
     assert o.price_asof(T0 + 2 * 300_000 + 1) == 2.0  # inside bar 2: its open, not bar 3
     assert np.isnan(o.price_asof(T0 - 1))
+
+
+def test_binance_prices_are_put_on_the_hyperliquid_level():
+    p = np.linspace(100, 120, 30)
+    out = validate_against(five_min(p / 1.005), daily(p))  # Binance 0.5% below Hyperliquid
+    assert out is not None and np.isclose(out["close"].iloc[-1], p[-1], rtol=1e-6)
+
+
+def test_holes_inside_a_cached_layer_are_found():
+    from hlwf.market import has_holes
+    t = np.r_[np.arange(0, 100), np.arange(500, 600)] * 900_000
+    df = pd.DataFrame({"t": t})
+    assert has_holes(df, 900_000, 0, int(t[-1]))
+    assert not has_holes(df, 900_000, 500 * 900_000, int(t[-1]))

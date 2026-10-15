@@ -161,9 +161,34 @@ def equity_on(equity: pd.Series | None, T: np.ndarray) -> np.ndarray:
     return e.to_numpy(float)[np.maximum(i, 0)]
 
 
+def liquidation_days(he: pd.DataFrame, hr: pd.DataFrame, days: np.ndarray, maint: dict,
+                     default_mm: float) -> np.ndarray:
+    """Days on which the follower would be liquidated inside the day: from the
+    day's opening capital, the hourly marked equity (exposure x hourly return,
+    summed over coins) falls below the maintenance margin of the book (cross
+    margin: sum of |exposure| x each coin's maintenance fraction). The daily
+    close alone would miss a crash that recovers before midnight."""
+    out = np.zeros(len(days), dtype=bool)
+    if he.empty:
+        return out
+    E = he.fillna(0.0)
+    R = hr.reindex(columns=E.columns).fillna(0.0)
+    port = (E.to_numpy(float) * R.to_numpy(float)).sum(axis=1)
+    mm = np.array([maint.get(c, default_mm) for c in E.columns])
+    need = (np.abs(E.to_numpy(float)) * mm).sum(axis=1)
+    di = np.searchsorted(days, E.index.to_numpy(np.int64), side="right") - 1
+    for k in np.unique(di[di >= 0]):
+        m = di == k
+        equity = 1.0 + np.cumsum(port[m])  # after each hour, over the day's opening capital
+        # the margin needed is that of the book held during the hour
+        if (equity <= need[m]).any():
+            out[k] = True
+    return out
+
+
 def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: int,
              cost_bps: dict | None = None, funding: dict | None = None, equity: pd.Series | None = None,
-             max_leverage: float = 20.0, hourly: bool = True) -> CopyResult:
+             max_leverage: float = 20.0, hourly: bool = True, maint: dict | None = None) -> CopyResult:
     """Copy every coin in `events` and mark the follower to market daily.
 
     Returns are PnL over the wallet's account value at the start of the day
@@ -271,5 +296,9 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
         hcap = capd.reindex(hours, method="ffill").bfill().to_numpy(float)
         he = pd.DataFrame(H_pos, index=hours).div(np.where(np.isnan(hcap), np.inf, hcap), axis=0)
         hr = pd.DataFrame(H_ret, index=hours)
+        liq = liquidation_days(he, hr, days, maint or {}, 1.0 / (2.0 * max_leverage))
+        if liq.any():
+            daily["liquidated"] = liq
+            daily.loc[liq, "ret"] = -1.0  # the follower's capital is gone that day
     cd = pd.DataFrame(coin_pnl, index=pd.to_datetime(days, unit="ms")) if coin_pnl else pd.DataFrame()
     return CopyResult(daily=daily, by_coin=by_coin, trades=trades, hourly_expo=he, hourly_ret=hr, coin_daily=cd)

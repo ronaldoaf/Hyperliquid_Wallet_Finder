@@ -179,3 +179,17 @@ def test_last_partial_day_is_marked_at_end_price():
     res = run([fill(T0 + H, "BTC", "B", 1, 0)], 0, end=end, oracle=AsOf())
     o = AsOf()
     assert res.daily["pnl"].sum() == pytest.approx(o.price(end) - o.price(T0 + H))
+
+
+def test_intraday_crash_that_recovers_is_still_a_liquidation():
+    from hlwf.copysim import liquidation_days
+    hours = T0 + H * np.arange(48, dtype=np.int64)
+    days = np.array([T0, T0 + D], dtype=np.int64)
+    he = pd.DataFrame({"X": np.full(48, 15.0)}, index=hours)  # 15x long all along
+    r = np.zeros(48)
+    r[5], r[6] = -0.07, 0.08  # -7% then back: the day's close barely moves
+    hr = pd.DataFrame({"X": r}, index=hours)
+    liq = liquidation_days(he, hr, days, {"X": 0.025}, 0.025)
+    assert liq.tolist() == [True, False]
+    # at 3x the same dip is survivable
+    assert not liquidation_days(he / 5, hr, days, {"X": 0.025}, 0.025).any()

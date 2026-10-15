@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from hlwf.evaluate import Settings, classify
 from hlwf.pipeline import finalize
 
@@ -123,13 +124,16 @@ def test_start_check_catches_a_position_the_fills_cannot_explain():
     events = {"ETH": (np.array([t0 + 50 * D]), np.array([90.0]), 100.0)}
     fills = pd.DataFrame({"coin": ["ETH"], "px": [2000.0], "time": [t0 + 50 * D]})
     rows = [{"time": t0 + 2 * H, "coin": "BTC", "szi": "1.0", "usdc": "-1.0", "fundingRate": "0.00001", "nSamples": None}]
-    rs = start_check(events, rows, fills, t0)
+    rs = start_check(events, rows, fills, t0 - t0 % D)
     eth = [c for c in rs["coins"] if c["coin"] == "ETH"]
     assert rs["checked"] and eth and eth[0]["gap_usd"] == 100 * 2000.0
     # the same book that really was held from the start passes
     rows.append({"time": t0 + 2 * H, "coin": "ETH", "szi": "100.0", "usdc": "-2.0", "fundingRate": "0.00001", "nSamples": None})
-    rs = start_check(events, rows, fills, t0)
+    rs = start_check(events, rows, fills, t0 - t0 % D)
     assert not [c for c in rs["coins"] if c["coin"] == "ETH"]
+    # a day with no funding at all is a check too: the wallet held nothing
+    rs = start_check(events, [], fills, t0 - t0 % D)
+    assert rs["checked"] and rs["gap_usd"] == 100 * 2000.0
 
 
 def test_longer_delay_must_also_leave_the_follower_richer():
@@ -147,3 +151,37 @@ def test_positions_carried_into_the_test_are_not_entries():
     hours = NOW + H * np.arange(48)
     he = pd.DataFrame({c: np.full(48, 0.1) for c in "ABCDEFGHIJ"}, index=hours)
     assert style(SimpleNamespace(hourly_expo=he), NOW)["opens"] == 0
+
+
+def test_daily_funding_rows_give_the_price_not_n_times_it():
+    import pandas as pd
+    from hlwf.evaluate import start_check
+    d0 = NOW - NOW % D
+    # 1 BTC held all day at 60k, rate 1e-5: 24 payments of 0.6 = 14.4 USDC
+    rows = [{"time": d0, "coin": "BTC", "szi": "1.0", "usdc": "-14.4", "fundingRate": "0.00001", "nSamples": 24}]
+    rs = start_check({}, rows, pd.DataFrame(columns=["coin", "px"]), d0)
+    assert rs["book_usd"] == pytest.approx(60_000.0)
+
+
+def test_carried_equity_adds_pnl_since_the_reading_and_never_looks_ahead():
+    import pandas as pd
+    from hlwf.evaluate import carried_equity
+    days = pd.to_datetime([NOW + k * D for k in range(4)], unit="ms")
+    pnl = pd.Series([10.0, 20.0, -5.0, 0.0], index=days)
+    readings = pd.Series([1000.0, 5000.0], index=[NOW, NOW + 3 * D])  # a deposit shows up on day 3
+    eq = carried_equity(readings, pnl)
+    assert eq.tolist() == [1000.0, 1010.0, 1030.0, 5000.0]
+
+
+def test_follower_pays_to_enter_the_inherited_book_and_to_leave():
+    import pandas as pd
+    from types import SimpleNamespace
+    from hlwf.evaluate import with_edge_costs
+    days = pd.to_datetime([NOW + k * D for k in range(3)], unit="ms")
+    daily = pd.DataFrame({"pnl": 0.0, "fees": 0.0, "ret": 0.0, "capital": 1000.0}, index=days)
+    trades = pd.DataFrame({"coin": ["BTC"], "t_exec": [NOW - D], "q": [2.0]})  # bought before the split, never sold
+    oracle = SimpleNamespace(price_asof=lambda t: 100.0)
+    d = with_edge_costs(SimpleNamespace(trades=trades, daily=daily), {"BTC": oracle}, {"BTC": 10.0}, NOW, NOW + 2 * D + 1)
+    # 2 x 100 x 10 bp = 0.2 to enter on the first day, 0.2 to leave on the last
+    assert d["pnl"].tolist() == pytest.approx([-0.2, 0.0, -0.2])
+    assert d["ret"].iloc[0] == pytest.approx(-0.0002)

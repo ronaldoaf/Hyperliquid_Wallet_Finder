@@ -101,6 +101,8 @@ def download(c: InfoClient, addr: str, start_ms: int, now: int, need_from: int |
     if st["complete"]:
         tw, rec["twap_to"] = download_twap(c, addr, start_ms, now)
         rec["fills"] = fills + tw
+        # a TWAP walk cut short (thousands of slices in one millisecond) bounds what is complete
+        rec["complete_to"] = min(rec["complete_to"], int(rec["twap_to"]))
     return rec
 
 
@@ -128,8 +130,8 @@ def extend(c: InfoClient, addr: str, rec: dict, now: int) -> dict:
     if not joined:
         cov = int(new[0]["time"]) if new else now
     tw, twap_to = download_twap(c, addr, max(int(rec.get("twap_to", cov)) - HOUR_MS, cov), now)
-    return {**rec, "fills": rec["fills"] + new + tw, "coverage": cov, "complete_to": int(st["complete_to"]),
-            "fetched_at": now, "twap_to": int(twap_to)}
+    return {**rec, "fills": rec["fills"] + new + tw, "coverage": cov,
+            "complete_to": int(min(st["complete_to"], twap_to)), "fetched_at": now, "twap_to": int(twap_to)}
 
 
 def funding_rows(c: InfoClient, addr: str, t_ms: int, data_dir: str = "data") -> list[dict]:
@@ -172,7 +174,8 @@ def account_states(c: InfoClient, addr: str, old: dict | None) -> tuple[dict | N
             if st is None and dex not in (old.get("dexes_checked") or []):
                 continue
         checked.append(dex)
-        if st and st.get("assetPositions"):
+        # kept with positions or with margin parked on it (it counts in the wallet's equity)
+        if st and (st.get("assetPositions") or float((st.get("marginSummary") or {}).get("accountValue") or 0)):
             dex_states[dex] = st
     return main, dex_states, checked
 

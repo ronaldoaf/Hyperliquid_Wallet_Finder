@@ -52,6 +52,7 @@ class Market:
         self._ctx: dict | None = None
         self._oracles: dict = {}
         self._candles: dict = {}   # refreshed once per process
+        self.errors: set = set()   # coins whose price download failed in this process
         self._funding: dict = {}
         self.http = requests.Session()
 
@@ -86,23 +87,43 @@ class Market:
                 imp = x.get("impactPxs")
                 spread = (float(imp[1]) - float(imp[0])) / mid if (imp and mid) else None
                 ctx[u["name"]] = {"vlm": float(x.get("dayNtlVlm") or 0), "spread": spread,
-                                  "delisted": bool(u.get("isDelisted")), "hip3": dex is not None}
+                                  "delisted": bool(u.get("isDelisted")), "hip3": dex is not None,
+                                  "max_lev": float(u.get("maxLeverage") or 0) or None}
         save_gz(path, {"fetched_at": int(time.time() * 1000), "ctx": ctx})
         self._ctx = ctx
         return ctx
 
-    def cost_bps(self, coin: str, taker_bps: float = 4.5, hip3_fee_mult: float = 2.0) -> float:
+    def maintenance(self, coin: str, default_lev: float = 20.0) -> float:
+        """Maintenance margin as a fraction of notional: half the initial margin
+        at the coin's maximum leverage (Hyperliquid's rule)."""
+        try:
+            lev = (self.contexts().get(coin) or {}).get("max_lev")
+        except Exception:
+            lev = None
+        return 1.0 / (2.0 * (lev or default_lev))
+
+    def cost_bps(self, coin: str, taker_bps: float = 4.5, hip3_fee_mult: float = 2.0,
+                 window_ntl: float | None = None) -> float:
         """One-way cost of a copier's market order: taker fee + half spread + impact.
 
-        The spread/impact part comes from today's 24h volume (a liquidity tier)
-        or today's impact spread, whichever is larger; delisted or unknown
-        coins get the worst tier.
+        The spread/impact part comes from a liquidity tier of the daily volume
+        (the lower of today's 24h volume and `window_ntl`, the median daily
+        volume over the simulated window, so a busy day does not make a whole
+        window cheap) or today's impact spread, whichever is larger. Delisted
+        or unknown coins, or any failure to read the market data, get the
+        worst tier: a failure never makes a coin cheaper.
         """
-        x = self.contexts().get(coin)
         fee = taker_bps * (hip3_fee_mult if (":" in coin) else 1.0)
+        try:
+            x = self.contexts().get(coin)
+        except Exception as e:
+            self.log(f"  contexts: {e}")
+            x = None
         if not x or x["delisted"]:
             return fee + 25.0
         v = x["vlm"]
+        if window_ntl is not None and np.isfinite(window_ntl):
+            v = min(v, window_ntl)
         tier = 1.0 if v >= 1e9 else 2.0 if v >= 1e8 else 5.0 if v >= 2e7 else 10.0 if v >= 2e6 else 25.0
         half = (x["spread"] or 0.0) / 2 * 1e4
         return fee + max(tier, half)
@@ -135,6 +156,7 @@ class Market:
                                     "req": {"coin": coin, "interval": interval, "startTime": int(a), "endTime": now}})
             except Exception as e:
                 self.log(f"  candles {coin} {interval}: {e}")
+                self.errors.add(coin)
                 page = []
             for r in page or []:
                 rows[int(r["t"])] = [int(r["t"]), float(r["o"]), float(r["c"]), float(r.get("v") or 0)]
@@ -286,17 +308,26 @@ class Market:
         firsts = [int(x["t"].iloc[0]) for _, _, x in layers if len(x)]
         covered = end_ms if holes or not firsts else min(firsts)  # the coarse layers must cover it all
         for iv in ("15m", "1h", "4h"):
-            if covered <= start_ms + INTERVAL_MS[iv]:
+            if covered <= start_ms + INTERVAL_MS[iv] and not holes:
                 break
             df = self.candles(coin, iv, start_ms)
             if len(df):
                 layers.append((f"hl{iv}", INTERVAL_MS[iv], df))
                 covered = min(covered, int(df["t"].iloc[0]))
+                # a cache refreshed after more than 5000 bars keeps a hole inside: go one layer coarser
+                holes = has_holes(df, INTERVAL_MS[iv], max(start_ms, covered), end_ms)
         if len(daily):
             layers.append(("hl1d", INTERVAL_MS["1d"], daily))
         o = PriceOracle(coin, layers, daily)
         self._oracles[key] = o
         return o
+
+
+def has_holes(df: pd.DataFrame, step: int, start_ms: int, end_ms: int) -> bool:
+    """Missing bars inside [start_ms, end_ms] (more than two steps apart)."""
+    t = df["t"].to_numpy(np.int64)
+    t = t[(t >= start_ms) & (t <= end_ms)]
+    return len(t) > 1 and bool((np.diff(t) > 2 * step).any())
 
 
 def validate_against(bn: pd.DataFrame, daily: pd.DataFrame, tol: float = 0.02) -> pd.DataFrame | None:
@@ -315,12 +346,14 @@ def validate_against(bn: pd.DataFrame, daily: pd.DataFrame, tol: float = 0.02) -
     ratio = float((j["hl"] / j["bn"]).median())
     for k in (1.0, 1000.0, 0.001):
         if abs(ratio / k - 1) < tol:
-            if k != 1.0:
-                bn = bn.copy()
-                bn[["open", "close"]] *= k
             dev = (j["hl"] / (j["bn"] * k) - 1).abs()
             if float(dev.quantile(0.9)) > 0.05:
                 return None
+            # on Hyperliquid's level: the unit factor and the median basis, so a
+            # position opened at a Binance price and marked at a Hyperliquid one
+            # does not book the basis as profit or loss
+            bn = bn.copy()
+            bn[["open", "close"]] *= ratio
             return bn[["t", "open", "close"]]
     return None
 

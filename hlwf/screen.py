@@ -172,8 +172,13 @@ def score_portfolio(pf: dict, split_ms: int, min_weeks: int = 12, min_active: in
     w_all = pf.get("perpAllTime") or pf.get("allTime") or {}
     w_month = pf.get("perpMonth") or pf.get("month") or {}
     vlm = max(float(w_all.get("vlm") or 0.0) - float(w_month.get("vlm") or 0.0), 0.0)
+    # that volume spans from the first point to a month ago; spread it evenly
+    # and keep the pre-split share, so numerator and denominator cover the same span
+    t0, t_split = int(h["time"].iloc[0]), int(ins["time"].iloc[-1])
+    t_vol = max(int(h["time"].iloc[-1]) - 30 * DAY_MS, t_split)
+    vlm *= (t_split - t0) / max(t_vol - t0, 1)
     mean_av = float(ins["account_value"].clip(lower=0).mean())
-    years = max((ins["time"].iloc[-1] - ins["time"].iloc[0]) / DAY_MS / 365.0, 30 / 365.0)
+    years = max((t_split - t0) / DAY_MS / 365.0, 30 / 365.0)
     out["turnover"] = vlm / max(mean_av, 1.0) / years
     r = weekly_returns(ins)
     active = r["dpnl"].abs() > 1e-6
