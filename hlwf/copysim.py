@@ -193,9 +193,10 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
 
     Returns are PnL over the wallet's account value at the start of the day
     (a follower who sizes in proportion to the wallet's equity), with the
-    capital floored at the day's peak gross exposure / `max_leverage`, so
-    that a stale or tiny equity reading cannot blow up a return, and a
-    follower never runs more than `max_leverage`. The peak is taken at the
+    capital floored at the day's peak gross exposure / `max_leverage` and at
+    the initial margin each coin requires at its maximum leverage on the
+    exchange (from `maint`), so that a stale or tiny equity reading cannot
+    blow up a return, and a follower never runs more leverage than it may. The peak is taken at the
     start and end of the day and around every order of the follower, coin by
     coin (their sum bounds the true peak from above, so trades opened and
     closed inside one day count too). A follower cannot lose more than its
@@ -206,7 +207,7 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
     day0 = (start_ms // DAY_MS) * DAY_MS
     days = np.arange(day0, end_ms, DAY_MS, dtype=np.int64)  # days that start before the end
     hours = np.arange(((start_ms + HOUR_MS - 1) // HOUR_MS) * HOUR_MS, end_ms, HOUR_MS, dtype=np.int64)
-    cols = {k: np.zeros(len(days)) for k in ("price", "fees", "funding", "gross", "gross_peak")}
+    cols = {k: np.zeros(len(days)) for k in ("price", "fees", "funding", "gross", "gross_peak", "margin_peak")}
     per_coin, all_trades, H_expo, H_ret, H_pos, coin_pnl = [], [], {}, {}, {}, {}
     for coin, ev in events.items():
         o = oracles.get(coin)
@@ -266,6 +267,8 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
             peak = np.zeros(len(days))
             np.maximum.at(peak, di, np.maximum(np.abs(held), np.abs(held - q)) * px)
             cols["gross_peak"] += peak
+            # initial margin at the coin's maximum leverage (2 x its maintenance fraction)
+            cols["margin_peak"] += peak * 2.0 * (maint or {}).get(coin, 1.0 / (2.0 * max_leverage))
         n_open = int(((np.abs(np.r_[0.0, np.cumsum(q)[:-1]]) < EPS) & (np.abs(np.cumsum(q)) > EPS)).sum()) if len(q) else 0
         per_coin.append({"coin": coin, "price": float(price_pnl.sum()), "fees": float(-fee.sum()),
                          "funding": float(fund.sum()), "orders": len(tr), "opens": n_open,
@@ -278,7 +281,9 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
     eq = equity_on(equity, days.astype(float))
     g = daily["gross"].to_numpy()
     gross_prev = np.r_[g[0], g[:-1]]
-    cap = np.fmax(eq, np.maximum.reduce([gross_prev, g, daily["gross_peak"].to_numpy()]) / max_leverage)
+    # never more leverage than the follower's cap, nor than each coin allows on the exchange
+    cap = np.fmax(eq, np.maximum(np.maximum.reduce([gross_prev, g, daily["gross_peak"].to_numpy()]) / max_leverage,
+                                 daily["margin_peak"].to_numpy()))
     cap = np.where(np.isnan(cap) | (cap < 1.0), np.nan, cap)
     daily["equity"] = eq
     daily["capital"] = cap

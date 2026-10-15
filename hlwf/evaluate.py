@@ -295,8 +295,8 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
     # covered (at most 40 coins, plus any coin with 5% or more), and only
     # inside the test period. Elsewhere, and before the split (where a choice
     # made with test-period exposure must not reach the in-sample screen), a
-    # flat rate: the main dex's base rate, and zero on HIP-3 dexes (their base
-    # rates are lower, and a flat rate would credit their shorts with income).
+    # flat rate: the main dex's base rate, or the typical rate of the coin's
+    # HIP-3 dex (lower; the main one would credit their shorts with income).
     probe = simulate(events, oracles, main, eval_start, cfg.end_ms, costs, None, eq, cfg.max_leverage)
     he = probe.hourly_expo
     share = he[he.index >= oos_start].abs().sum() if len(he) else pd.Series(dtype=float)
@@ -313,7 +313,7 @@ def evaluate_wallet(addr: str, cfg: Settings, market: Market, client: InfoClient
     hours = np.arange((eval_start // HOUR_MS) * HOUR_MS, cfg.end_ms + HOUR_MS, HOUR_MS, dtype=np.int64)
     f0 = oos_start
     for coin in oracles:
-        flat = 0.0 if ":" in coin else BASE_FUNDING
+        flat = market.flat_funding(coin, BASE_FUNDING) if hasattr(market, "flat_funding") else BASE_FUNDING
         base = pd.Series(flat, index=hours)
         if coin in chosen:
             real = market.funding(coin, f0 - HOUR_MS, cfg.end_ms)

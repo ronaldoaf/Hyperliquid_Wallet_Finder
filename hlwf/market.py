@@ -53,6 +53,7 @@ class Market:
         self._oracles: dict = {}
         self._candles: dict = {}   # refreshed once per process
         self.errors: set = set()   # coins whose price download failed in this process
+        self._dex_rate: dict = {}
         self._funding: dict = {}
         self.http = requests.Session()
 
@@ -92,6 +93,24 @@ class Market:
         save_gz(path, {"fetched_at": int(time.time() * 1000), "ctx": ctx})
         self._ctx = ctx
         return ctx
+
+    def flat_funding(self, coin: str, main_rate: float) -> float:
+        """Flat hourly funding for a coin without its own series: the main
+        dex's base rate, or on a HIP-3 dex the median of the medians of that
+        dex's cached series (0 if none): their base rates are lower."""
+        if ":" not in coin:
+            return main_rate
+        dex = coin.split(":")[0]
+        if dex not in self._dex_rate:
+            meds = []
+            d = os.path.join(self.dir, "funding")
+            for fn in os.listdir(d) if os.path.isdir(d) else []:
+                if fn.startswith(dex + "_"):
+                    rows = (load_gz(os.path.join(d, fn)) or {}).get("rows") or []
+                    if rows:
+                        meds.append(float(np.median([r[1] for r in rows])))
+            self._dex_rate[dex] = float(np.median(meds)) if meds else 0.0
+        return self._dex_rate[dex]
 
     def maintenance(self, coin: str, default_lev: float = 20.0) -> float:
         """Maintenance margin as a fraction of notional: half the initial margin

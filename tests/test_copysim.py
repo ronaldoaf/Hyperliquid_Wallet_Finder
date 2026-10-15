@@ -193,3 +193,13 @@ def test_intraday_crash_that_recovers_is_still_a_liquidation():
     assert liq.tolist() == [True, False]
     # at 3x the same dip is survivable
     assert not liquidation_days(he / 5, hr, days, {"X": 0.025}, 0.025).any()
+
+
+def test_capital_covers_each_coins_initial_margin():
+    # wallet equity reading of 100 against a 1,000-notional position on a coin capped at 5x:
+    # the follower needs at least 200 of margin, so returns are over 200, not 100
+    eq = pd.Series([100.0], index=[T0 - D])
+    ev = position_events(prepare_fills([fill(T0 + H, "ALT", "B", 10, 0)]))
+    o = LinearOracle(slope=0.0)
+    res = simulate(ev, {"ALT": o}, 0, T0, T0 + 3 * D, equity=eq, maint={"ALT": 1 / (2 * 5.0)})
+    assert res.daily["capital"].min() == pytest.approx(200.0)
