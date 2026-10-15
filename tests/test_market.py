@@ -48,3 +48,10 @@ def test_oracle_prefers_finest_layer_and_never_looks_back():
     px, tx, src = o.exec_price([T0 + 10 * D + 1, T0 + 5 * D + 1])
     assert px.tolist() == [2.0, 1.0]
     assert tx[0] == T0 + 10 * D + 300_000 and tx[1] == T0 + 6 * D  # first bar starting at or after T
+
+
+def test_price_asof_never_uses_a_later_bar():
+    bars = pd.DataFrame({"t": T0 + np.arange(0, 12) * 300_000, "open": np.arange(12.0), "close": np.arange(12.0)})
+    o = PriceOracle("X", [("fine", 300_000, bars)], bars)
+    assert o.price_asof(T0 + 2 * 300_000 + 1) == 2.0  # inside bar 2: its open, not bar 3
+    assert np.isnan(o.price_asof(T0 - 1))

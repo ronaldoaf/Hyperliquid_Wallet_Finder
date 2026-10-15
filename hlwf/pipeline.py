@@ -30,7 +30,7 @@ def run_dir(data_dir: str, tag: str) -> str:
     return os.path.join(data_dir, "results", tag)
 
 
-def code_hash() -> str:
+def _hash_modules() -> str:
     h = hashlib.sha1()
     here = os.path.dirname(os.path.abspath(__file__))
     for fn in RESULT_MODULES:
@@ -39,11 +39,27 @@ def code_hash() -> str:
     return h.hexdigest()[:12]
 
 
+_CODE_HASH: str | None = None
+
+
+def code_hash() -> str:
+    """Hash of the code that produces results, taken once per process: files
+    edited while a scan runs do not change the stamp of what it computed."""
+    global _CODE_HASH
+    if _CODE_HASH is None:
+        _CODE_HASH = _hash_modules()
+    return _CODE_HASH
+
+
 def git_commit() -> str | None:
+    """HEAD, with '+dirty' if the package differs from it."""
+    here = os.path.dirname(os.path.abspath(__file__))
     try:
-        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() or None
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here, capture_output=True, text=True, timeout=5)
+        head = r.stdout.strip() or None
+        d = subprocess.run(["git", "status", "--porcelain", "--", "."], cwd=here, capture_output=True, text=True,
+                           timeout=5)
+        return f"{head}+dirty" if head and d.stdout.strip() else head
     except Exception:
         return None
 
@@ -63,10 +79,10 @@ def save_daily(path: str, art: dict) -> None:
         cols[f"pnl_{k}"] = d["pnl"]
     if cols:
         df = pd.DataFrame(cols)
-        main = daily.get(30)
+        main = daily.get(art.get("main_delay", 30))
         if main is not None:
-            df["gross_30"] = main["gross"]
-            df["capital_30"] = main["capital"]
+            df["gross_main"] = main["gross"]
+            df["capital_main"] = main["capital"]
         df.to_csv(path, compression="gzip")
 
 
@@ -132,13 +148,13 @@ def finalize(results: list[dict], cfg: Settings) -> pd.DataFrame:
 
     The family is every wallet sent to stage C except those whose copy was
     already losing before the split. A wallet in the family that cannot be
-    tested (short coverage, few entries) counts as p = 1, which is
-    conservative."""
+    tested (short coverage, few entries, a download error) counts as p = 1,
+    which is conservative."""
     k = cfg.main_delay_min
     fam, p = [], []
     for s in results:
-        if s.get("status") == "erro" or fails_insample(s, cfg):
-            continue
+        if s.get("status") != "erro" and fails_insample(s, cfg):
+            continue  # a download error is not a pre-split screen: it stays as p = 1
         m = s.get(f"oos_{k}") or {}
         enough = sample_problem(s, cfg) is None
         fam.append(s)
@@ -176,17 +192,20 @@ def annotate_roles(client: InfoClient, results: list[dict], verdicts=("aprovada"
 
 
 def flat_row(s: dict, cfg: Settings) -> dict:
+    """One CSV row per wallet. `*_main` columns are the main delay
+    (cfg.main_delay_min); `ret_ann_<d>` exist for every simulated delay."""
     k = cfg.main_delay_min
     m = s.get(f"oos_{k}") or {}
     st = s.get("style") or {}
     bc = s.get("by_coin") or []
     row = {
         "address": s["address"], "verdict": s.get("verdict"), "in_family": s.get("in_family"),
-        "why": "; ".join(s.get("why") or []),
-        "oos_days": round(s.get("oos_days", 0), 1), "active_days": m.get("active_days"), "ret_ann_30": m.get("ret_ann"), "sharpe_30": m.get("sharpe_ann"),
-        "t_30": m.get("t"), "p_30": s.get("p_used"), "q": s.get("q"), "maxdd_30": m.get("maxdd"),
-        "pnl_30": m.get("pnl"), "fees_30": m.get("fees"), "funding_30": m.get("funding"),
-        "lev_avg": m.get("lev_avg"), "pnl_ex_top5": m.get("pnl_ex_top5"),
+        "why": "; ".join(s.get("why") or []), "main_delay_min": k,
+        "oos_days": round(s.get("oos_days", 0), 1), "active_days": m.get("active_days"),
+        "ret_ann_main": m.get("ret_ann"), "ret_comp_main": m.get("ret_comp"), "ruined_main": m.get("ruined"),
+        "sharpe_main": m.get("sharpe_ann"), "t_main": m.get("t"), "p_main": s.get("p_used"), "q": s.get("q"),
+        "maxdd_main": m.get("maxdd"), "pnl_main": m.get("pnl"), "fees_main": m.get("fees"),
+        "funding_main": m.get("funding"), "lev_avg": m.get("lev_avg"), "pnl_ex_top5": m.get("pnl_ex_top5"),
         "shift_p": (s.get("shift") or {}).get("p"), "alpha_t": (s.get("alpha") or {}).get("t_alpha"),
         "beta_btc": (s.get("alpha") or {}).get("beta"),
         "opens": st.get("opens"), "hold_days": st.get("hold_days"), "long_share": st.get("long_share"),
@@ -195,16 +214,15 @@ def flat_row(s: dict, cfg: Settings) -> dict:
         "last_fill": pd.Timestamp(s["last_fill"], unit="ms").strftime("%Y-%m-%d") if s.get("last_fill") else None,
         "eff_delay_min": s.get("eff_delay_min"),
     }
-    for d in ("ref", 60, 120, 240):
+    for d in ["ref"] + sorted(set(cfg.delays_min) | {k}):
         row[f"ret_ann_{d}"] = (s.get(f"oos_{d}") or {}).get("ret_ann")
     ins = s.get(f"is_{k}") or {}
-    row["is_ret_ann_30"] = ins.get("ret_ann")
-    row["is_t_30"] = ins.get("t")
-    row["ret_comp_30"] = m.get("ret_comp")
-    row["ruined_30"] = m.get("ruined")
+    row["is_ret_ann_main"] = ins.get("ret_ann")
+    row["is_t_main"] = ins.get("t")
     row["n_twap"] = s.get("n_twap")
     row["jump_share"] = s.get("jump_share")
     row["recon_share"] = (s.get("recon") or {}).get("share")
+    row["recon_start_share"] = (s.get("recon_start") or {}).get("share")
     row["pnl_check_oos"] = (s.get("pnl_check_oos") or {}).get("rel")
     return row
 
@@ -242,6 +260,9 @@ def run_scan(data_dir: str = "data", out_root: str = "reports", split_days: int 
         print(f"stage B: {int(b['ok'].sum())} scored, {len(ok)} with positive in-sample t; testing {len(sel)}",
               flush=True)
     cfg = Settings(split_ms=split, end_ms=end, **(cfg_kw or {}))
+    # the selection is made; now the equity history of the chosen wallets must
+    # reach the end of the test (stage B may have been downloaded days ago)
+    fetch_portfolios(client, sel["address"], data_dir, max_age_h=6, verbose=False)
     results = evaluate_many(list(sel["address"]), cfg, data_dir, client, tag, verbose=verbose)
     table = finalize(results, cfg)
     annotate_roles(client, results)

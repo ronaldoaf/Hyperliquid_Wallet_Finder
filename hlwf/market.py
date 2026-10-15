@@ -27,6 +27,7 @@ INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000,
 HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
 BINANCE = "https://data.binance.vision/data/futures/um"
+PUBLISH_LAG_DAYS = 3  # Binance archive files can appear this long after their day or month ends
 
 
 def safe(coin: str) -> str:
@@ -144,7 +145,10 @@ class Market:
         return df
 
     # ---------------------------------------------------------------- binance
-    def _binance_file(self, url: str, path: str) -> pd.DataFrame | None:
+    def _binance_file(self, url: str, path: str, final: bool = True) -> pd.DataFrame | None:
+        """One archive file, cached. A 404 is remembered only when `final`:
+        Binance publishes daily and monthly files with a lag, so a recent
+        file that is missing today may exist tomorrow."""
         if os.path.exists(path):
             return pd.read_csv(path)
         if os.path.exists(path + ".missing"):
@@ -154,7 +158,7 @@ class Market:
         except requests.RequestException:
             return None
         if r.status_code != 200:
-            if r.status_code == 404:
+            if r.status_code == 404 and final:
                 open(path + ".missing", "w").close()
             return None
         with zipfile.ZipFile(io.BytesIO(r.content)) as z:
@@ -177,13 +181,16 @@ class Market:
         os.makedirs(d, exist_ok=True)
         now = pd.Timestamp.now("UTC").tz_localize(None)
         yday = (now - pd.Timedelta(days=1)).floor("D")
+        settled = now.floor("D") - pd.Timedelta(days=PUBLISH_LAG_DAYS)  # files before this are final
         marker = os.path.join(d, "NOSYMBOL")
         if os.path.exists(marker) and time.time() - os.path.getmtime(marker) < 7 * 86400:
             return empty
-        # listed today? (yesterday's daily file exists)
-        probe = self._binance_file(f"{BINANCE}/daily/klines/{sym}/5m/{sym}-5m-{yday:%Y-%m-%d}.zip",
-                                   os.path.join(d, f"{yday:%Y-%m-%d}.csv.gz"))
-        if probe is None:
+        # Listed now? One of the last daily files exists. Yesterday's alone is
+        # not enough: early in the UTC day it is usually not published yet.
+        recent = [yday - pd.Timedelta(days=k) for k in range(PUBLISH_LAG_DAYS + 1)]
+        if not any(self._binance_file(f"{BINANCE}/daily/klines/{sym}/5m/{sym}-5m-{day:%Y-%m-%d}.zip",
+                                      os.path.join(d, f"{day:%Y-%m-%d}.csv.gz"), final=day < settled) is not None
+                   for day in recent):
             open(marker, "w").close()
             return empty
         start = pd.Timestamp(start_ms, unit="ms")
@@ -192,7 +199,8 @@ class Market:
         months = [m for m in pd.period_range(start.to_period("M"), end.to_period("M"), freq="M") if m < cur]
         with ThreadPoolExecutor(8) as ex:  # the archive is a CDN: no API weight, latency bound
             got = list(ex.map(lambda m: self._binance_file(
-                f"{BINANCE}/monthly/klines/{sym}/5m/{sym}-5m-{m}.zip", os.path.join(d, f"{m}.csv.gz")), months))
+                f"{BINANCE}/monthly/klines/{sym}/5m/{sym}-5m-{m}.zip", os.path.join(d, f"{m}.csv.gz"),
+                final=m.end_time < settled), months))
         frames = [x for x in got if x is not None]
         # current month, or last month's file not published yet: daily files
         daily_months = [cur] + [m for m, x in zip(months, got) if x is None and m == cur - 1]
@@ -201,7 +209,7 @@ class Market:
         with ThreadPoolExecutor(8) as ex:
             got = list(ex.map(lambda day: self._binance_file(
                 f"{BINANCE}/daily/klines/{sym}/5m/{sym}-5m-{day:%Y-%m-%d}.zip",
-                os.path.join(d, f"{day:%Y-%m-%d}.csv.gz")), days))
+                os.path.join(d, f"{day:%Y-%m-%d}.csv.gz"), final=day < settled), days))
         frames += [x for x in got if x is not None]
         if not frames:
             return empty
@@ -270,8 +278,13 @@ class Market:
         # No Binance (HIP-3, Hyperliquid-only coins): 15m for the last 52 days and
         # 1h before that. The follower then trades up to one bar later than the
         # nominal delay, which only makes the test harder to pass.
+        # A hole inside the Binance series (a day missing from the archive, an
+        # outage) would otherwise fall through to the daily candle: fetch the
+        # coarser Hyperliquid layers to fill it.
+        holes = bn is not None and len(bn) > 1 and bool(
+            (np.diff(bn.loc[bn["t"] >= start_ms, "t"].to_numpy(np.int64)) > HOUR_MS).any())
         firsts = [int(x["t"].iloc[0]) for _, _, x in layers if len(x)]
-        covered = min(firsts) if firsts else end_ms
+        covered = end_ms if holes or not firsts else min(firsts)  # the coarse layers must cover it all
         for iv in ("15m", "1h", "4h"):
             if covered <= start_ms + INTERVAL_MS[iv]:
                 break
@@ -341,6 +354,15 @@ class PriceOracle:
             src[sel] = li
             todo[sel] = False
         return px, tx, src
+
+    def price_asof(self, T: int) -> float:
+        """Last known price at time T: the open of the bar that contains T, from
+        the finest series that covers T (never a price from after T)."""
+        for _, step, t, o in self.layers:
+            i = int(np.searchsorted(t, T, side="right")) - 1
+            if i >= 0 and T - t[i] < step:
+                return float(o[i])
+        return float("nan")
 
     def daily_close(self) -> pd.Series:
         d = self.daily

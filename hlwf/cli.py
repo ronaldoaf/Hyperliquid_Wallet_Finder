@@ -45,7 +45,7 @@ def cmd_wallet(a):
                                       cfg_kw=_cfg_kw(a))
     tag = pd.Timestamp(cfg.split_ms, unit="ms").strftime("avulsas_%Y-%m-%d")
     path = write_wallet_report(a.out, a.data_dir, tag, cfg, table, results, "Carteiras avulsas")
-    cols = ["address", "verdict", "oos_days", "ret_ann_30", "t_30", "shift_p", "alpha_t", "why"]
+    cols = ["address", "verdict", "oos_days", "ret_ann_main", "t_main", "shift_p", "alpha_t", "why"]
     with pd.option_context("display.width", 200, "display.max_colwidth", 90):
         print(table[cols].to_string(index=False))
     print(f"report: {path}")
@@ -61,9 +61,15 @@ def cmd_track(a):
     if not addrs:
         print("selection is empty")
         return
-    start = int(sel["selected_at"])
+    # the forward test starts at the first UTC midnight after the selection, so
+    # no hour that went into picking the wallet counts as evidence for it
+    day = 86_400_000
+    start = -(-int(sel["selected_at"]) // day) * day
     tag = pd.Timestamp(start, unit="ms").strftime("acompanhamento_%Y-%m-%d")
-    kw = _cfg_kw(a) | {"min_oos_days": 1}
+    # a forward test of a few weeks cannot meet the scan's sample sizes: scale them
+    days = max((time.time() * 1000 - start) / day, 0.0)
+    kw = _cfg_kw(a) | {"min_oos_days": 1, "min_active_days": int(min(40, 0.6 * days)),
+                       "min_opens": int(min(10, max(1, days // 6)))}
     table, results, cfg = run_wallets(addrs, a.data_dir, a.out, budget=a.budget, cfg_kw=kw, split_ms=start, tag=tag)
     path = write_wallet_report(a.out, a.data_dir, tag, cfg, table, results,
                                f"Acompanhamento da seleção de {pd.Timestamp(start, unit='ms'):%d/%m/%Y}")
@@ -85,21 +91,29 @@ def cmd_positions(a):
             addrs.append(x.lower())
     c = InfoClient(budget=a.budget)
     now = int(time.time() * 1000)
+    dexes = [None] + c.perp_dexes()
     for addr in addrs:
-        st = c.post({"type": "clearinghouseState", "user": addr})
-        av = float(st["marginSummary"]["accountValue"])
-        print(f"\n## {addr}  (patrimônio em perps US$ {av:,.0f})")
-        rows = []
-        for p in st.get("assetPositions", []):
-            x = p["position"]
-            szi = float(x["szi"])
-            ntl = float(x["positionValue"])
-            rows.append({"moeda": x["coin"], "lado": "long" if szi > 0 else "short", "tamanho": abs(szi),
-                         "entrada": float(x["entryPx"]), "nocional": ntl, "alav": ntl / av if av else float("nan"),
-                         "PnL aberto": float(x["unrealizedPnl"]), "liquidação": x.get("liquidationPx")})
-        print(pd.DataFrame(rows).to_string(index=False) if rows else "sem posições abertas")
-        fills = c.post({"type": "userFillsByTime", "user": addr, "startTime": now - a.hours * 3_600_000,
-                        "aggregateByTime": True})
+        # every perp dex: HIP-3 positions and margin sit in their own clearinghouse
+        av, rows = 0.0, []
+        for dex in dexes:
+            st = c.post({"type": "clearinghouseState", "user": addr} | ({"dex": dex} if dex else {}))
+            av += float((st.get("marginSummary") or {}).get("accountValue") or 0.0)
+            for p in st.get("assetPositions", []):
+                x = p["position"]
+                szi = float(x["szi"])
+                rows.append({"moeda": x["coin"], "lado": "long" if szi > 0 else "short", "tamanho": abs(szi),
+                             "entrada": float(x["entryPx"]), "nocional": float(x["positionValue"]),
+                             "PnL aberto": float(x["unrealizedPnl"]), "liquidação": x.get("liquidationPx")})
+        print(f"\n## {addr}  (patrimônio em perps, todas as dex: US$ {av:,.0f})")
+        if rows:
+            df = pd.DataFrame(rows)
+            df.insert(5, "alav", df["nocional"] / av if av else float("nan"))
+            print(df.to_string(index=False))
+        else:
+            print("sem posições abertas")
+        # the endpoint returns the oldest page of the window: walk it to reach the latest fills
+        fills = c.paginate_time({"type": "userFillsByTime", "user": addr, "aggregateByTime": True},
+                                now - a.hours * 3_600_000, now, page_limit=2000)
         fills = [f for f in fills if not f["coin"].startswith("@") and "/" not in f["coin"]]
         if fills:
             df = pd.DataFrame(fills)

@@ -14,8 +14,9 @@ class FakeAPI(InfoClient):
     """userFillsByTime / userTwapSliceFillsByTime as the exchange serves them:
     the oldest 2000 rows of the window, and only the history from `served_from` on."""
 
-    def __init__(self, fills, served_from=0, twap=(), positions=None, dex_positions=None):
+    def __init__(self, fills, served_from=0, twap=(), positions=None, dex_positions=None, funding=()):
         super().__init__(budget=10**9)
+        self.funding = list(funding)
         self.fills = sorted(fills, key=lambda f: f["time"])
         self.served_from = served_from
         self.twap = list(twap)
@@ -35,7 +36,19 @@ class FakeAPI(InfoClient):
                                        for c, s in pos.items()]}
         a, b = body["startTime"], body.get("endTime", NOW)
         if kind == "userFillsByTime":
-            return [f for f in self.fills if f["time"] >= self.served_from and a <= f["time"] <= b][:2000]
+            rows = [f for f in self.fills if f["time"] >= self.served_from and a <= f["time"] <= b]
+            if body.get("aggregateByTime"):  # one row per order and millisecond
+                agg = {}
+                for f in rows:
+                    k = (f["time"], f["oid"])
+                    if k in agg:
+                        agg[k] = {**agg[k], "sz": str(float(agg[k]["sz"]) + float(f["sz"]))}
+                    else:
+                        agg[k] = dict(f)
+                rows = list(agg.values())
+            return rows[:2000]
+        if kind == "userFunding":
+            return [r for r in self.funding if a <= r["time"] <= b][:500]
         if kind == "userTwapSliceFillsByTime":
             return [x for x in self.twap if a <= x["fill"]["time"] <= b][:2000]
         raise ValueError(kind)
@@ -166,3 +179,26 @@ def test_max_pages_reports_where_the_walk_stopped():
                                            page_limit=2000, max_pages=1, status=st)
     assert not st["complete"] and st["complete_to"] == max(f["time"] for f in rows) - 1
     assert np.all(np.diff([f["time"] for f in rows]) >= 0)
+
+
+def test_sweep_of_one_millisecond_is_not_truncated(tmp_path):
+    # one market order fills against 2,500 makers in the same millisecond
+    sweep = [{**fill(T0 + 5 * D, 1000 + i, start=100 + i), "oid": 999} for i in range(2500)]
+    fills = series(n_days=5, per_day=20) + sweep + [fill(T0 + 6 * D, 5000, start=2600)]
+    rec = wl.fetch_wallet(FakeAPI(fills), "0xabc", T0, str(tmp_path))
+    assert rec["complete_to"] == NOW
+    at = [f for f in rec["fills"] if f["time"] == T0 + 5 * D]
+    assert len(at) == 1 and float(at[0]["sz"]) == 2500.0  # the whole sweep, aggregated by order
+
+
+def test_extend_starts_where_the_cache_is_complete(tmp_path):
+    # a record complete only up to day 54 also holds fills of days 60-70 (joined from an older
+    # cache); extending must fetch days 55-59 instead of resuming after day 70
+    all_fills = series(n_days=100, per_day=10)
+    head = [f for f in all_fills if f["time"] < T0 + 55 * D]
+    tail = [f for f in all_fills if T0 + 60 * D <= f["time"] < T0 + 70 * D]
+    rec = {"v": wl.FORMAT, "fills": head + tail, "coverage": T0, "complete_to": T0 + 55 * D - 1,
+           "asked_from": T0, "fetched_at": NOW - 10 * D, "twap_to": T0}
+    new = wl.extend(FakeAPI(all_fills), "0xabc", rec, NOW)
+    got = {f["tid"] for f in new["fills"]}
+    assert {f["tid"] for f in all_fills} <= got and new["coverage"] == T0

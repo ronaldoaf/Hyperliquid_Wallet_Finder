@@ -54,8 +54,16 @@ def load_leaderboard(data_dir: str = "data", max_age_h: float = 24.0, verbose: b
 def stage_a(lb: pd.DataFrame, min_volume: float = 50e6, leaky: bool = False,
             min_account_value: float = 10_000) -> pd.DataFrame:
     """Activity filter. `leaky=True` also requires positive all-time PnL and a
-    current account value, which is faster but biases the out-of-sample test."""
-    m = lb["allTime_vlm"] >= min_volume
+    current account value, which is faster but biases the out-of-sample test.
+
+    The volume is today's all-time volume minus the last month's, an upper
+    bound of the volume before a split at least a month back: every wallet
+    that met the threshold at the split is kept, and the wallets that only
+    crossed it in the last month (by trading after the split) are not let in.
+    Those that crossed it earlier in the test period still are: a residual
+    survivorship bias, stated in the report."""
+    vol = lb["allTime_vlm"] - lb["month_vlm"].fillna(0.0).clip(lower=0.0) if "month_vlm" in lb else lb["allTime_vlm"]
+    m = vol >= min_volume
     if leaky:
         m &= (lb["allTime_pnl"] > 0) & (lb["account_value"] >= min_account_value)
     return lb[m].sort_values("allTime_vlm", ascending=False).reset_index(drop=True)
@@ -127,23 +135,46 @@ def weekly_returns(h: pd.DataFrame, min_gap_days: float = 2.0, min_capital: floa
     return out[~bogus].iloc[1:].reset_index(drop=True)
 
 
+def with_total_equity(h: pd.DataFrame, pf: dict) -> pd.DataFrame:
+    """Perp PnL history with the capital stage C uses: the larger of perp and
+    total account value (as of each point). With unified margin the perp
+    account value alone can be near zero while the trader has millions."""
+    tot = history(pf, "allTime")
+    if h.empty or tot.empty:
+        return h
+    t = tot.set_index("time")["account_value"].sort_index()
+    i = np.searchsorted(t.index.to_numpy(np.int64), h["time"].to_numpy(np.int64), side="right") - 1
+    asof = np.where(i >= 0, t.to_numpy(float)[np.maximum(i, 0)], np.nan)
+    return h.assign(account_value=np.fmax(h["account_value"].to_numpy(float), asof))
+
+
 def score_portfolio(pf: dict, split_ms: int, min_weeks: int = 12, min_active: int = 8, recent_weeks: int = 8,
                     min_account_value: float = 10_000, max_turnover: float = 20_000) -> dict:
     """In-sample score from the weekly perp history up to the split date."""
     h = history(pf, "perpAllTime")
     if h.empty:
         h = history(pf, "allTime")
+    else:
+        h = with_total_equity(h, pf)
     out = {"ok": False, "reason": ""}
     if h.empty:
         out["reason"] = "sem histórico"
         return out
-    # volume over average equity, per year of history: market makers and HFT
-    # run at tens of thousands of times their equity a year, swing traders at hundreds
-    vlm = float((pf.get("perpAllTime") or pf.get("allTime") or {}).get("vlm") or 0.0)
-    mean_av = float(h["account_value"].clip(lower=0).mean())
-    years = max((h["time"].iloc[-1] - h["time"].iloc[0]) / DAY_MS / 365.0, 30 / 365.0)
-    out["turnover"] = vlm / max(mean_av, 1.0) / years
     ins = h[h["time"] <= split_ms]
+    if ins.empty:
+        out["reason"] = "sem histórico antes do corte"
+        return out
+    # Volume over average equity, per year: market makers and HFT run at tens
+    # of thousands of times their equity a year, swing traders at hundreds.
+    # Equity and years come from before the split; the volume is all-time
+    # minus the last month (the API gives no volume history), so it still
+    # holds part of the test period: a partial leak, stated in the report.
+    w_all = pf.get("perpAllTime") or pf.get("allTime") or {}
+    w_month = pf.get("perpMonth") or pf.get("month") or {}
+    vlm = max(float(w_all.get("vlm") or 0.0) - float(w_month.get("vlm") or 0.0), 0.0)
+    mean_av = float(ins["account_value"].clip(lower=0).mean())
+    years = max((ins["time"].iloc[-1] - ins["time"].iloc[0]) / DAY_MS / 365.0, 30 / 365.0)
+    out["turnover"] = vlm / max(mean_av, 1.0) / years
     r = weekly_returns(ins)
     active = r["dpnl"].abs() > 1e-6
     if active.any():

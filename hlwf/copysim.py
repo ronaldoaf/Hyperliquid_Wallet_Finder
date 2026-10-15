@@ -112,6 +112,7 @@ class CopyResult:
     trades: pd.DataFrame                      # follower orders
     hourly_expo: pd.DataFrame = field(default_factory=pd.DataFrame)  # hours x coins, exposure / capital
     hourly_ret: pd.DataFrame = field(default_factory=pd.DataFrame)   # hours x coins, return of the hour
+    coin_daily: pd.DataFrame = field(default_factory=pd.DataFrame)   # days x coins, PnL after costs
 
 
 def _wallet_pos_at(times: np.ndarray, pos: np.ndarray, pos0: float, T: np.ndarray) -> np.ndarray:
@@ -150,12 +151,14 @@ def follower_orders(ev: tuple, oracle, delay_ms: int, start_ms: int, end_ms: int
 
 
 def equity_on(equity: pd.Series | None, T: np.ndarray) -> np.ndarray:
-    """Wallet account value interpolated at times T (ms)."""
+    """Wallet account value at times T (ms): the last reading at or before T,
+    as a follower would know it (no interpolation toward a later reading).
+    Before the first reading, the first one."""
     if equity is None or equity.empty:
         return np.full(len(T), np.nan)
     e = equity.sort_index()
-    return np.interp(T, e.index.to_numpy(np.int64).astype(float), e.to_numpy(float),
-                     left=float(e.iloc[0]), right=float(e.iloc[-1]))
+    i = np.searchsorted(e.index.to_numpy(np.int64), np.asarray(T, dtype=np.int64), side="right") - 1
+    return e.to_numpy(float)[np.maximum(i, 0)]
 
 
 def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: int,
@@ -179,16 +182,24 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
     days = np.arange(day0, end_ms, DAY_MS, dtype=np.int64)  # days that start before the end
     hours = np.arange(((start_ms + HOUR_MS - 1) // HOUR_MS) * HOUR_MS, end_ms, HOUR_MS, dtype=np.int64)
     cols = {k: np.zeros(len(days)) for k in ("price", "fees", "funding", "gross", "gross_peak")}
-    per_coin, all_trades, H_expo, H_ret, H_pos = [], [], {}, {}, {}
+    per_coin, all_trades, H_expo, H_ret, H_pos, coin_pnl = [], [], {}, {}, {}, {}
     for coin, ev in events.items():
         o = oracles.get(coin)
         if o is None:
             continue
         tr = follower_orders(ev, o, delay_ms, start_ms, end_ms)
         close = o.daily_close()
-        C = close.reindex(days).ffill().bfill().to_numpy(float) if len(close) else np.full(len(days), np.nan)
+        C = (np.array(close.reindex(days).ffill().bfill(), dtype=float) if len(close)  # writable copy
+             else np.full(len(days), np.nan))
         if np.isnan(C).all():
             continue
+        # the last day is cut at end_ms: mark it at the price then, not at the
+        # daily candle's close (which may be later, when the candle was fetched)
+        asof = getattr(o, "price_asof", None)
+        if asof is not None and len(days) and end_ms - days[-1] < DAY_MS:
+            p_end = asof(int(end_ms))
+            if np.isfinite(p_end):
+                C[-1] = p_end
         # positions at the end of each day and trades inside each day
         di = np.minimum(np.searchsorted(days, tr["t_exec"].to_numpy(np.int64), side="right") - 1, len(days) - 1)
         q = tr["q"].to_numpy(float)
@@ -223,6 +234,7 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
         cols["price"] += price_pnl
         cols["fees"] -= fee
         cols["funding"] += fund
+        coin_pnl[coin] = price_pnl - fee + fund
         cols["gross"] += np.abs(eod) * C
         if len(q):
             held = np.cumsum(q)
@@ -259,4 +271,5 @@ def simulate(events: dict, oracles: dict, delay_ms: int, start_ms: int, end_ms: 
         hcap = capd.reindex(hours, method="ffill").bfill().to_numpy(float)
         he = pd.DataFrame(H_pos, index=hours).div(np.where(np.isnan(hcap), np.inf, hcap), axis=0)
         hr = pd.DataFrame(H_ret, index=hours)
-    return CopyResult(daily=daily, by_coin=by_coin, trades=trades, hourly_expo=he, hourly_ret=hr)
+    cd = pd.DataFrame(coin_pnl, index=pd.to_datetime(days, unit="ms")) if coin_pnl else pd.DataFrame()
+    return CopyResult(daily=daily, by_coin=by_coin, trades=trades, hourly_expo=he, hourly_ret=hr, coin_daily=cd)

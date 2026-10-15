@@ -58,6 +58,12 @@ def coverage_start(c: InfoClient, addr: str, start_ms: int, first_ms: int | None
     return first_ms if first_ms is not None else int(time.time() * 1000)
 
 
+def one_ms(c: InfoClient, addr: str):
+    """Every fill of one millisecond, aggregated by order (for a market order
+    that hit more makers than one page holds)."""
+    return lambda t: c.post({**FILLS, "aggregateByTime": True, "user": addr, "startTime": int(t), "endTime": int(t)})
+
+
 def download_twap(c: InfoClient, addr: str, start_ms: int, end_ms: int) -> tuple[list[dict], int]:
     st: dict = {}
     rows = c.paginate_time({**TWAP, "user": addr}, start_ms, end_ms, key=lambda x: fill_key(x["fill"]),
@@ -76,7 +82,7 @@ def download(c: InfoClient, addr: str, start_ms: int, now: int, need_from: int |
 
     st: dict = {}
     new = c.paginate_time({**FILLS, "user": addr}, start_ms, now, key=fill_key, page_limit=PAGE,
-                          first_page_stop=hopeless, status=st)
+                          first_page_stop=hopeless, status=st, overflow=one_ms(c, addr))
     cov = info["cov"] if "cov" in info else coverage_start(c, addr, start_ms, int(new[0]["time"]) if new else None)
     asked = start_ms
     fills = list(new)
@@ -99,21 +105,49 @@ def download(c: InfoClient, addr: str, start_ms: int, now: int, need_from: int |
 
 
 def extend(c: InfoClient, addr: str, rec: dict, now: int) -> dict:
-    """Fetch what came after the cache. The first page must hold the last
-    cached fill again; if the API no longer serves it, the fills between it
-    and the first one served are lost and the coverage restarts there."""
-    fills = [f for f in rec["fills"] if f.get("twapId") is None]
-    if not fills:
-        return download(c, addr, int(rec["asked_from"]), now, None, None)
-    last = max(fills, key=lambda f: f["time"])
+    """Fetch what came after the cache, from where the cache is known to be
+    complete (`complete_to`; fills cached after it may sit after a hole). The
+    walk restarts at the last cached fill up to there, and the first page
+    must hold that fill again: if the API no longer serves it, the fills
+    between it and the first one served are lost and the coverage restarts
+    there. Cached TWAP slices are kept."""
+    upto = int(rec["complete_to"])
+    base = [f for f in rec["fills"] if f.get("twapId") is None and int(f["time"]) <= upto]
     st: dict = {}
-    new = c.paginate_time({**FILLS, "user": addr}, int(last["time"]), now, key=fill_key, page_limit=PAGE, status=st)
+    body = {**FILLS, "user": addr}
     cov = int(rec["coverage"])
-    if fill_key(last) not in {fill_key(f) for f in new}:
+    if base:
+        last = max(base, key=lambda f: f["time"])
+        new = c.paginate_time(body, int(last["time"]), now, key=fill_key, page_limit=PAGE, status=st,
+                              overflow=one_ms(c, addr))
+        joined = fill_key(last) in {fill_key(f) for f in new}
+    else:  # no ordinary fill in the cached window: anything older still served proves continuity
+        new = c.paginate_time(body, upto + 1, now, key=fill_key, page_limit=PAGE, status=st,
+                              overflow=one_ms(c, addr))
+        joined = served_before(c, addr, upto + 1)
+    if not joined:
         cov = int(new[0]["time"]) if new else now
     tw, twap_to = download_twap(c, addr, max(int(rec.get("twap_to", cov)) - HOUR_MS, cov), now)
     return {**rec, "fills": rec["fills"] + new + tw, "coverage": cov, "complete_to": int(st["complete_to"]),
             "fetched_at": now, "twap_to": int(twap_to)}
+
+
+def funding_rows(c: InfoClient, addr: str, t_ms: int, data_dir: str = "data") -> list[dict]:
+    """The wallet's funding payments on the UTC day of `t_ms` (cached). Each row
+    carries the position size the payment was charged on (`szi`): hourly rows
+    for recent days; for older days one row per coin, whose `szi` is the
+    average over `nSamples` hourly payments. An independent record of what the
+    wallet held, whatever the fills the API still serves."""
+    d0 = (int(t_ms) // DAY_MS) * DAY_MS
+    path = os.path.join(wallet_dir(data_dir, addr), f"funding_{d0}.json.gz")
+    cached = load_gz(path)
+    if cached is not None:
+        return cached
+    rows = c.paginate_time({"type": "userFunding", "user": addr.lower()}, d0, d0 + DAY_MS - 1,
+                           key=lambda x: (x["time"], x["delta"]["coin"]), page_limit=500)
+    out = [{"time": int(r["time"]), **r["delta"]} for r in rows if (r.get("delta") or {}).get("type") == "funding"]
+    save_gz(path, out)
+    return out
 
 
 def account_states(c: InfoClient, addr: str, old: dict | None) -> tuple[dict | None, dict, list[str]]:
@@ -156,16 +190,19 @@ def fetch_wallet(c: InfoClient, addr: str, start_ms: int, data_dir: str = "data"
     path = os.path.join(wallet_dir(data_dir, addr), "fills.json.gz")
     rec = load_gz(path)
     now = int(time.time() * 1000)
-    if rec and rec.get("v") == FORMAT and rec["asked_from"] <= start_ms:
+    reuse = rec and rec.get("v") == FORMAT and rec["asked_from"] <= start_ms
+    if reuse:
         fresh = now - rec["fetched_at"] < max_age_h * 3600_000 and rec["complete_to"] >= (need_to or 0)
         if fresh or (need_from is not None and rec["coverage"] > need_from):  # coverage only moves forward
             return rec
-        new = extend(c, addr, rec, now)
-    else:
-        new = download(c, addr, start_ms, now, need_from, rec)
+    # the account state first, then the fills up to a later time, so that every
+    # position in the state is explained by fills already downloaded
+    states = account_states(c, addr, rec)
+    now = int(time.time() * 1000)
+    new = extend(c, addr, rec, now) if reuse else download(c, addr, start_ms, now, need_from, rec)
     merged = {fill_key(f): f for f in new["fills"]}
     new["fills"] = sorted(merged.values(), key=lambda f: f["time"])
-    new["state"], new["dex_states"], new["dexes_checked"] = account_states(c, addr, rec)
+    new["state"], new["dex_states"], new["dexes_checked"] = states
     save_gz(path, new)
     return new
 
@@ -216,11 +253,12 @@ def equity_series(data_dir: str, addr: str) -> pd.Series:
         return perp
     if perp.empty:
         return tot
+    # each reading combined with the latest reading of the other series (as of
+    # that time: no interpolation toward the future)
     idx = tot.index.union(perp.index)
-    x = idx.to_numpy(float)
-    a = np.interp(x, tot.index.to_numpy(float), tot.to_numpy(float))
-    b = np.interp(x, perp.index.to_numpy(float), perp.to_numpy(float))
-    return pd.Series(np.maximum(a, b), index=idx)
+    a = tot.reindex(idx, method="ffill").to_numpy(float)
+    b = perp.reindex(idx, method="ffill").to_numpy(float)
+    return pd.Series(np.fmax(a, b), index=idx)
 
 
 def perp_pnl_series(data_dir: str, addr: str) -> pd.Series:

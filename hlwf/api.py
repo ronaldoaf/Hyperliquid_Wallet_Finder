@@ -102,7 +102,8 @@ class InfoClient:
                       time_of: Callable[[dict], int] = lambda x: int(x["time"]),
                       page_limit: int = 500, max_pages: int | None = None,
                       first_page_stop: Callable[[list], bool] | None = None,
-                      status: dict | None = None) -> list[dict]:
+                      status: dict | None = None,
+                      overflow: Callable[[int], list] | None = None) -> list[dict]:
         """Walk forward over an endpoint that takes startTime/endTime and returns
         the oldest `page_limit` rows of the window. The next page starts at the
         last timestamp seen (rows sharing it across pages are deduplicated).
@@ -112,7 +113,14 @@ class InfoClient:
         `max_pages` or `first_page_stop` cut the walk short) and `complete_to`:
         the time up to which every row was walked (`end_ms` if complete; else
         just before the last timestamp seen, whose rows may continue on the
-        next page)."""
+        next page).
+
+        More than `page_limit` rows in one millisecond (a market order that
+        fills against thousands of makers) cannot be paged through: the walk
+        would skip the rest. `overflow(t)` then supplies every row of that
+        millisecond some other way (for fills: aggregated by order), which
+        replaces the rows seen there; without it the walk stops and reports
+        itself incomplete just before that millisecond."""
         end_ms = end_ms or int(time.time() * 1000)
         seen: set = set()
         out: list[dict] = []
@@ -135,7 +143,18 @@ class InfoClient:
             if (max_pages and pages >= max_pages) or (pages == 1 and first_page_stop and first_page_stop(page)):
                 complete = False
                 break
-            cur = last_t + 1 if new == 0 else last_t
+            if new == 0:  # a full page inside one millisecond: the rest of it is out of reach
+                if overflow is None:
+                    complete = False
+                    break
+                rows = overflow(last_t)
+                out = [x for x in out if time_of(x) != last_t] + rows
+                seen.update(key(x) for x in rows)
+                if status is not None:
+                    status.setdefault("overflow", []).append(int(last_t))
+                cur = last_t + 1
+                continue
+            cur = last_t
         out.sort(key=time_of)
         if status is not None:
             status["complete"] = complete

@@ -36,32 +36,26 @@ def equity_pct(ret: pd.Series) -> pd.Series:
     return (np.exp(np.log1p(ret.clip(lower=-0.9999)).cumsum()) - 1) * 100
 
 
-def copy_curves(daily: pd.DataFrame, split, path: str, title: str) -> None:
-    """Compounded copy return (%) for each delay, from the first active day."""
-    cols = [c for c in daily.columns if c.startswith("ret_")]
-    active = (daily[cols].abs() > 0).any(axis=1)
-    if active.any():
-        first = max(daily.index[active.to_numpy().argmax()] - pd.Timedelta(days=3), daily.index[0])
-        daily = daily[daily.index >= min(first, split)]
+def copy_curves(daily: pd.DataFrame, split, path: str, title: str, main: int = 30) -> None:
+    """Compounded copy return (%) for each delay over the test period only
+    (from the split), so the curve ends where the card's compounded return is."""
+    daily = daily[daily.index >= pd.Timestamp(split).floor("D")]
     fig, ax = plt.subplots(figsize=(8, 3.8), dpi=130, facecolor=SURFACE)
     _style(ax)
     if "ret_ref" in daily:
         ax.plot(daily.index, equity_pct(daily["ret_ref"]), color=REF_COLOR, lw=1.5,
                 label="imediata, sem custos (referência)")
-    for d, c in DELAY_COLORS.items():
-        col = f"ret_{d}"
-        if col in daily:
-            lab = f"{d} min" if d < 60 else f"{d // 60} h"
-            ax.plot(daily.index, equity_pct(daily[col]), color=c, lw=2.0 if d == 30 else 1.5,
-                    label=f"atraso de {lab}")
-    ax.axvline(split, color=INK2, lw=1)
-    ax.annotate("início do teste fora da amostra", xy=(split, 1), xycoords=("data", "axes fraction"),
-                xytext=(4, -4), textcoords="offset points", fontsize=8, color=INK2, va="top", ha="left")
+    found = sorted(int(c[4:]) for c in daily.columns if c.startswith("ret_") and c[4:].isdigit())
+    ramp = list(DELAY_COLORS.values())
+    for i, d in enumerate(found):  # ordinal blue ramp, shortest delay darkest
+        lab = f"{d} min" if d < 60 or d % 60 else f"{d // 60} h"
+        ax.plot(daily.index, equity_pct(daily[f"ret_{d}"]), color=ramp[min(i, len(ramp) - 1)],
+                lw=2.0 if d == main else 1.5, label=f"atraso de {lab}")
     loc = mdates.AutoDateLocator(minticks=4, maxticks=8)
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc, show_offset=False))
     ax.axhline(0, color=INK2, lw=0.8)
-    ax.set_ylabel("retorno composto da cópia (%)", color=INK2, fontsize=8)
+    ax.set_ylabel("retorno composto da cópia no teste (%)", color=INK2, fontsize=8)
     ax.set_title(title, color=INK, fontsize=10, loc="left")
     leg = ax.legend(fontsize=7.5, frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=5,
                     handlelength=1.5, columnspacing=1.2)

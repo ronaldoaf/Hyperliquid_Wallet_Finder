@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .charts import copy_curves
-from .evaluate import Settings
+from .evaluate import Settings, sample_problem
 from .pipeline import load_daily, run_dir
 from .store import load_gz, save_json
 
@@ -27,7 +27,7 @@ def conclusion(counts: Counter, table: pd.DataFrame, cfg: Settings) -> str:
         return (f"{n_ok} carteira(s) passaram em todos os critérios. Ainda assim, acompanhe-as com `track` antes "
                 "de copiar: o teste cobre só alguns meses.")
     fam = int(table["in_family"].fillna(False).astype(bool).sum())
-    best = table[table["in_family"].fillna(False).astype(bool)]["p_30"].min()
+    best = table[table["in_family"].fillna(False).astype(bool)]["p_main"].min()
     txt = (f"nenhuma carteira passou. Com {fam} testes na família, a correção de Benjamini-Hochberg pede um "
            f"p perto de {num(cfg.q_max / max(fam, 1), 4)} para a melhor; a melhor teve p = {num(best, 4)}. ")
     if n_pr:
@@ -80,7 +80,32 @@ def day(ms) -> str:
 def delay_label(d) -> str:
     if d == "ref":
         return "imediata, sem custos"
-    return f"{d} min" if d < 60 else f"{d // 60} h"
+    if d < 60 or d % 60:
+        return f"{d} min"
+    return f"{d // 60} h"
+
+
+def delays(cfg: Settings) -> list:
+    return ["ref"] + sorted(set(cfg.delays_min) | {cfg.main_delay_min})
+
+
+def criteria_text(cfg: Settings) -> str:
+    """Every rule `classify` applies, written from the settings."""
+    main = delay_label(cfg.main_delay_min)
+    rob = ", ".join(delay_label(d) for d in cfg.robust_delays_min)
+    return (
+        "Critérios para **aprovada** (todos fora da amostra, com custos): (1) dados suficientes: fills completos "
+        f"no teste, pelo menos {cfg.min_oos_days} dias de teste, {cfg.min_active_days} dias posicionada e "
+        f"{cfg.min_opens} entradas, posição sem fill visível ≤ {cfg.max_jump_share * 100:.0f}% do volume e posições "
+        f"reconstruídas batendo com a conta no fim e com o histórico de funding no início (diferença ≤ "
+        f"{cfg.max_recon_share * 100:.0f}% do nocional); (2) a cópia com {main} deixa o copiador mais rico: "
+        "retorno médio diário, retorno composto e PnL em US$ positivos, sem nenhum dia que leve todo o capital; "
+        f"(3) o mesmo com {rob} de atraso; (4) q de Benjamini-Hochberg ≤ {num(cfg.q_max)} (sobre a família do "
+        f"teste final) para o retorno médio diário com {main}; (5) habilidade além da direção do mercado: teste "
+        f"de deslocamento p ≤ {num(cfg.skill_p_max)} ou alfa sobre o BTC com t ≥ {num(cfg.skill_alpha_t, 1)}; "
+        "(6) lucro positivo sem os 5 melhores dias. **Promissora:** dados suficientes, p < 0,05 sem correção e "
+        f"o copiador mais rico com {main} e com {delay_label(cfg.robust_delays_min[0])}, mas falha algum outro "
+        "critério.")
 
 
 def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
@@ -93,7 +118,7 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
         L += [f"![cópia com atraso]({img_rel})", ""]
     L += ["| atraso | dias | retorno a.a. | Sharpe a.a. | t (HAC) | queda máx. | PnL (escala da carteira) | taxas+spread | funding |",
           "|---|---|---|---|---|---|---|---|---|"]
-    for d in ["ref", 30, 60, 120, 240]:
+    for d in delays(cfg):
         x = s.get(f"oos_{d}")
         if not x or x.get("days", 0) < 2:
             continue
@@ -123,7 +148,7 @@ def wallet_card(s: dict, cfg: Settings, img_rel: str | None) -> list[str]:
     bc = s.get("by_coin") or []
     if bc:
         top = sorted(bc, key=lambda x: -abs(x["pnl"]))[:6]
-        L.append("- **Por moeda (cópia de 30 min, janela inteira):** " +
+        L.append(f"- **Por moeda (cópia com {delay_label(cfg.main_delay_min)}, período de teste):** " +
                  ", ".join(f"{x['coin']} {usd(x['pnl'])}" for x in top) + ".")
     pos = s.get("open_positions") or {}
     L.append(f"- **Agora:** patrimônio em perps {usd(s.get('account_value_now'))}; último fill em "
@@ -145,12 +170,15 @@ def data_quality(s: dict) -> list[str]:
     if not s.get("complete_to"):
         return []
     rc = s.get("recon") or {}
+    rs = s.get("recon_start") or {}
     count = lambda n: f"{n or 0:,}".replace(",", ".")
     small = lambda x: "–" if x is None or not np.isfinite(x) else f"{x * 100:.1f}%".replace(".", ",")
     txt = (f"- **Dados:** fills completos de {day(s['coverage_start'])} a {day(s['complete_to'])} "
            f"({count(s.get('n_fills'))} fills, {count(s.get('n_twap'))} de TWAP); posição mudando sem fill visível: "
            f"{small(s.get('jump_share'))} do volume; posições reconstruídas contra a conta: diferença de "
-           f"{usd(abs(rc.get('gap_usd') or 0.0)).lstrip('+')} ({small(rc.get('share'))} do nocional)")
+           f"{usd(abs(rc.get('gap_usd') or 0.0)).lstrip('+')} ({small(rc.get('share'))} do nocional) no fim e "
+           + (f"{usd(abs(rs.get('gap_usd') or 0.0)).lstrip('+')} ({small(rs.get('share'))}) contra o funding no início"
+              if rs.get("checked") else "sem conferência no início"))
     pc = s.get("pnl_check_oos")
     if pc:
         txt += (f"; PnL da cópia imediata no teste {usd(pc['sim'])}, PnL de perps da conta no mesmo período "
@@ -161,7 +189,8 @@ def data_quality(s: dict) -> list[str]:
 def btc_change(data_dir: str, start_ms: int, end_ms: int) -> float | None:
     rows = load_gz(os.path.join(data_dir, "market", "candles", "BTC_1d.json.gz")) or []
     c = pd.Series({r[0]: r[2] for r in rows}).sort_index()
-    a, b = c[c.index <= start_ms], c[c.index <= end_ms]
+    # from the close of the day before the start (the candle of day d closes at the end of d)
+    a, b = c[c.index <= start_ms - 86_400_000], c[c.index <= end_ms]
     if a.empty or b.empty:
         return None
     return float(b.iloc[-1] / a.iloc[-1] - 1)
@@ -172,7 +201,7 @@ def persistence_section(table: pd.DataFrame, results: list[dict], cfg: Settings,
     (delay and costs)? And how many hits would chance alone produce?"""
     by = {s["address"]: s for s in results}
     fam = table[table["in_family"].fillna(False).astype(bool)]
-    testable = fam[fam["verdict"] != "dados insuficientes"]
+    testable = fam[[sample_problem(by[a], cfg) is None for a in fam["address"]]]
     n = len(testable)
     if n == 0:
         return []
@@ -189,8 +218,9 @@ def persistence_section(table: pd.DataFrame, results: list[dict], cfg: Settings,
          f"o acaso daria cerca de {num(n * 0.05, 1)} com p < 0,05 e {num(n * 0.01, 1)} com p < 0,01, e metade "
          "teria retorno médio positivo.", "",
          "| cópia | p < 0,05 | p < 0,01 | retorno médio > 0 |", "|---|---|---|---|"]
-    for key, lab in ((("oos_ref", "imediata, sem custos (o próprio trader)"), (f"oos_{k}", f"{k} min, com custos"))
-                     + tuple((f"oos_{d}", f"{d // 60} h, com custos") for d in cfg.robust_delays_min)):
+    for key, lab in ((("oos_ref", "imediata, sem custos (o próprio trader)"),
+                      (f"oos_{k}", f"{delay_label(k)}, com custos"))
+                     + tuple((f"oos_{d}", f"{delay_label(d)}, com custos") for d in cfg.robust_delays_min)):
         pos = sum(1 for a in testable["address"] if (by[a].get(key) or {}).get("ret_ann", 0) > 0)
         L.append(f"| {lab} | {count(key, 0.05)} | {count(key, 0.01)} | {pos} de {n} |")
     ch = btc_change(data_dir, cfg.split_ms, cfg.end_ms)
@@ -212,7 +242,7 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
     rd = run_dir(data_dir, tag)
     table = table.copy()
     table["_o"] = table["verdict"].map({v: i for i, v in enumerate(ORDER)}).fillna(9)
-    table = table.sort_values(["_o", "q", "p_30"]).drop(columns="_o")
+    table = table.sort_values(["_o", "q", "p_main"]).drop(columns="_o")
     table.to_csv(os.path.join(out, "resultados.csv"), index=False, float_format="%.6g")
     cols_b = [c for c in ["address", "ok", "reason", "n_weeks", "n_active", "t_w", "mean_w", "sd_w", "pos_frac",
                           "pnl_in", "maxdd_w", "av_split", "turnover"] if c in b.columns]
@@ -220,6 +250,8 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
     by_addr = {s["address"]: s for s in results}
     counts = Counter(table["verdict"])
     split_ts = pd.Timestamp(cfg.split_ms, unit="ms")
+    main = delay_label(cfg.main_delay_min)
+    rob = list(cfg.robust_delays_min)
 
     L = [f"# Varredura de {pd.Timestamp(cfg.end_ms, unit='ms'):%d/%m/%Y}: carteiras copiáveis com atraso", ""]
     L += [
@@ -236,7 +268,7 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
         f"{funnel['stage_b_scored']:,} pontuáveis antes do corte → {funnel['stage_b_positive']:,} com retorno semanal "
         f"positivo → **{funnel['stage_c']} simuladas** (as de maior t semanal antes do corte) → "
         f"**{funnel.get('family', funnel['stage_c'])} na família do teste final** (as que não perdiam dinheiro "
-        f"copiando com {cfg.main_delay_min} min nos {cfg.insample_days} dias antes do corte).".replace(",", "."),
+        f"copiando com {main} nos {cfg.insample_days} dias antes do corte).".replace(",", "."),
         "- **Resultado:** " + ", ".join(f"{counts.get(v, 0)} {PLURAL[v] if counts.get(v, 0) > 1 else v}"
                                         for v in ORDER if counts.get(v, 0)) + ".",
         "- **Conclusão:** " + conclusion(counts, table, cfg),
@@ -244,28 +276,27 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
         "mais meio spread/impacto por faixa de liquidez (1–25 bp), funding horário real nas moedas relevantes; "
         f"alavancagem do copiador limitada a {cfg.max_leverage:.0f}x.",
         "",
-        "Critérios para **aprovada** (todos fora da amostra, com custos): q de Benjamini-Hochberg ≤ "
-        f"{num(cfg.q_max)} (sobre a família do teste final) para o retorno médio diário com {cfg.main_delay_min} min de atraso; retorno positivo também "
-        f"com {', '.join(delay_label(d) for d in cfg.robust_delays_min)}; habilidade além da direção do mercado "
-        f"(teste de deslocamento p ≤ {num(cfg.skill_p_max)} ou alfa sobre o BTC com t ≥ {num(cfg.skill_alpha_t, 1)}); "
-        f"lucro positivo sem os 5 melhores dias; pelo menos {cfg.min_oos_days} dias e {cfg.min_opens} entradas no teste. "
-        "**Promissora:** p < 0,05 sem correção e lucro com 30 e 60 min, mas falha algum outro critério.",
+        criteria_text(cfg),
         "",
     ]
     show = table[table["verdict"].isin(["aprovada", "aprovada (inativa)", "promissora"])]
     if len(show):
         L += ["## Carteiras aprovadas e promissoras", "",
-              "| carteira | veredito | retorno a.a. 30 min | 1 h | 2 h | Sharpe | t | q | deslocamento p | alfa t | queda máx. | alav. | entradas | dias/posição | moedas principais |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+              f"| carteira | veredito | retorno a.a. {main} | " + " | ".join(delay_label(d) for d in rob)
+              + " | composto no teste | Sharpe | t | q | deslocamento p | alfa t | queda máx. | alav. | entradas | dias/posição | moedas principais |",
+              "|---|---|---|" + "---|" * len(rob) + "---|---|---|---|---|---|---|---|---|---|---|"]
         for _, r in show.iterrows():
-            L.append(f"| [{short(r['address'])}](#{r['address']}) | {r['verdict']} | {pct(r['ret_ann_30'])} | "
-                     f"{pct(r['ret_ann_60'])} | {pct(r['ret_ann_120'])} | {num(r['sharpe_30'], 1)} | {num(r['t_30'])} | "
-                     f"{num(r['q'], 3)} | {num(r['shift_p'], 3)} | {num(r['alpha_t'])} | {pct(-r['maxdd_30'] if r['maxdd_30'] is not None else None)} | "
+            L.append(f"| [{short(r['address'])}](#{r['address']}) | {r['verdict']} | {pct(r['ret_ann_main'])} | "
+                     + " | ".join(pct(r.get(f"ret_ann_{d}")) for d in rob)
+                     + f" | {pct(r['ret_comp_main'])} | {num(r['sharpe_main'], 1)} | {num(r['t_main'])} | "
+                     f"{num(r['q'], 3)} | {num(r['shift_p'], 3)} | {num(r['alpha_t'])} | "
+                     f"{pct(-r['maxdd_main'] if r['maxdd_main'] is not None else None)} | "
                      f"{num(r['lev_avg'], 1)}x | {int(r['opens'] or 0)} | {num(r['hold_days'], 1)} | {r['top_coins']} |")
         L.append("")
-        L += ["Retornos anualizados sobre o patrimônio da carteira (copiar na mesma proporção do patrimônio dela), "
-              "soma simples dos retornos diários × 365. Valores altos em janelas de 4 meses têm intervalos largos: "
-              "veja o intervalo de bootstrap em cada ficha.", ""]
+        L += ["Retorno a.a. = média simples dos retornos diários × 365 (sem capitalização), sobre o patrimônio da "
+              "carteira, como quem copia na mesma proporção do patrimônio dela. \"Composto no teste\" é quanto o "
+              "copiador teria ganhado de fato no período. Em janelas de 4 meses os intervalos são largos: veja o "
+              "intervalo de bootstrap em cada ficha.", ""]
         L += ["## Fichas", ""]
         for _, r in show.iterrows():
             s = by_addr[r["address"]]
@@ -273,7 +304,8 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
             rel = None
             if len(daily):
                 fn = f"{r['address']}.png"
-                copy_curves(daily, split_ts, os.path.join(img, fn), f"{short(r['address'])}: cópia por atraso")
+                copy_curves(daily, split_ts, os.path.join(img, fn), f"{short(r['address'])}: cópia por atraso, período de teste",
+                            cfg.main_delay_min)
                 rel = f"img/{fn}"
             L.append(f'<a id="{r["address"]}"></a>')
             L += wallet_card(s, cfg, rel)
@@ -297,13 +329,13 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
         for k, v in reasons.most_common():
             L.append(f"| {k} | {v} |")
         L.append("")
-    tested = table[table["verdict"].isin(["reprovada"])].sort_values("t_30", ascending=False).head(15)
+    tested = table[table["verdict"].isin(["reprovada"])].sort_values("t_main", ascending=False).head(15)
     if len(tested):
         L += ["### As 15 melhores entre as reprovadas", "",
-              "| carteira | retorno a.a. 30 min | t | q | deslocamento p | alfa t | beta BTC | lucro sem 5 melhores dias | motivo |",
+              f"| carteira | retorno a.a. {main} | t | q | deslocamento p | alfa t | beta BTC | lucro sem 5 melhores dias | motivo |",
               "|---|---|---|---|---|---|---|---|---|"]
         for _, r in tested.iterrows():
-            L.append(f"| [{short(r['address'])}]({EXPLORER}{r['address']}) | {pct(r['ret_ann_30'])} | {num(r['t_30'])} | "
+            L.append(f"| [{short(r['address'])}]({EXPLORER}{r['address']}) | {pct(r['ret_ann_main'])} | {num(r['t_main'])} | "
                      f"{num(r['q'], 2)} | {num(r['shift_p'], 3)} | {num(r['alpha_t'])} | {num(r['beta_btc'])} | "
                      f"{usd(r['pnl_ex_top5'])} | {r['why']} |")
         L.append("")
@@ -317,6 +349,11 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
           "Hyperliquid, e Hyperliquid nas últimas horas). Moedas sem Binance (HIP-3 e as exclusivas da Hyperliquid) "
           "usam velas de 15 min nos últimos 52 dias e de 1 h antes disso: o atraso efetivo fica maior (mais conservador).",
           "- Spread e impacto são estimados pela liquidez de hoje, não a da época. Copiadores grandes pagam mais.",
+          "- A seleção ainda vê um pouco do período de teste: o volume que define o universo (etapa A) e o giro que "
+          "exclui robôs de alta frequência (etapa B) são o volume total de hoje menos o do último mês, porque a API não "
+          "dá o histórico de volume. Carteiras que só passaram do limite operando entre o corte e o último mês entram; "
+          "o efeito é de sobrevivência (favorece quem continuou operando). A triagem antes do corte também depende de "
+          "quantos fills a API ainda guarda e usa o custo de liquidez de hoje.",
           "- A API serve só a parte mais recente dos fills (de horas a anos, conforme a carteira) e as fatias de TWAP "
           "das últimas semanas. Uma carteira sai como dados insuficientes se os fills não cobrem o teste até o fim, se "
           "a posição muda sem fill visível em mais de 2% do volume, ou se as posições reconstruídas não batem com as "
@@ -326,7 +363,7 @@ def write_scan_report(out_root: str, data_dir: str, tag: str, cfg: Settings, fun
     path = os.path.join(out, "RELATORIO.md")
     with open(path, "w") as f:
         f.write("\n".join(L))
-    sel = [{"address": r["address"], "verdict": r["verdict"], "ret_ann_30": r["ret_ann_30"], "q": r["q"]}
+    sel = [{"address": r["address"], "verdict": r["verdict"], "ret_ann_main": r["ret_ann_main"], "q": r["q"]}
            for _, r in show.iterrows()]
     save_json(os.path.join(out, "selecao.json"), {"selected_at": int(cfg.end_ms), "split_ms": int(cfg.split_ms),
                                                   "wallets": sel})
@@ -351,7 +388,8 @@ def write_wallet_report(out_root: str, data_dir: str, tag: str, cfg: Settings, t
         rel = None
         if len(daily):
             fn = f"{s['address']}_{tag}.png"
-            copy_curves(daily, split_ts, os.path.join(img, fn), f"{short(s['address'])}: cópia por atraso")
+            copy_curves(daily, split_ts, os.path.join(img, fn), f"{short(s['address'])}: cópia por atraso, período de teste",
+                        cfg.main_delay_min)
             rel = f"img/{fn}"
         L += wallet_card(s, cfg, rel)
     path = os.path.join(out, f"{tag}.md")

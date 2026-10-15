@@ -1,3 +1,4 @@
+import numpy as np
 from hlwf.evaluate import Settings, classify
 from hlwf.pipeline import finalize
 
@@ -11,8 +12,8 @@ def summary(ret=0.5, p=0.001, ret60=0.4, ret120=0.3, shift_p=0.01, alpha_t=1.0, 
          "oos_days": days, "last_fill": last_fill, "style": {"opens": opens},
          "shift": {"p": shift_p}, "alpha": {"t_alpha": alpha_t}}
     s["oos_30"] = {"days": days, "ret_ann": ret, "p": p, "pnl_ex_top5": ex_top5, "ret_comp": ret / 3, "pnl": 1000.0}
-    s["oos_60"] = {"days": days, "ret_ann": ret60}
-    s["oos_120"] = {"days": days, "ret_ann": ret120}
+    s["oos_60"] = {"days": days, "ret_ann": ret60, "ret_comp": ret60 / 3, "pnl": 1000.0 * np.sign(ret60)}
+    s["oos_120"] = {"days": days, "ret_ann": ret120, "ret_comp": ret120 / 3, "pnl": 1000.0 * np.sign(ret120)}
     return s
 
 
@@ -52,7 +53,7 @@ def test_finalize_counts_untestable_wallets_as_p1():
     short["address"] = "0xdef"
     table = finalize([good, short], CFG)
     row = table.set_index("address")
-    assert row.loc["0xdef", "p_30"] == 1.0
+    assert row.loc["0xdef", "p_main"] == 1.0
     # two tests: q of the good one is p * 2 / 1
     assert row.loc["0xabc", "q"] == 0.002
 
@@ -101,3 +102,48 @@ def test_stamp_changes_with_settings_and_end():
     assert a == run_stamp(Settings(split_ms=NOW - 120 * D, end_ms=NOW))
     assert a["settings_hash"] != run_stamp(Settings(split_ms=NOW - 120 * D, end_ms=NOW + 1))["settings_hash"]
     assert a["settings_hash"] != run_stamp(Settings(split_ms=NOW - 120 * D, end_ms=NOW, insample_days=90))["settings_hash"]
+
+
+def test_errors_count_as_p1_in_the_family():
+    good = summary(p=0.001)
+    err = {"address": "0xeee", "status": "erro", "reason": "boom"}
+    table = finalize([good, err], CFG).set_index("address")
+    assert table.loc["0xeee", "verdict"] == "erro" and table.loc["0xeee", "in_family"]
+    assert table.loc["0xabc", "q"] == 0.002
+
+
+def test_start_check_catches_a_position_the_fills_cannot_explain():
+    import numpy as np
+    import pandas as pd
+    from hlwf.evaluate import start_check
+    H = 3_600_000
+    t0 = NOW - 100 * D
+    # first visible fill sells 10 of a 100 ETH position built by TWAP slices that aged out:
+    # the rebuilt book holds 100 from the start, the funding history says the wallet held nothing
+    events = {"ETH": (np.array([t0 + 50 * D]), np.array([90.0]), 100.0)}
+    fills = pd.DataFrame({"coin": ["ETH"], "px": [2000.0], "time": [t0 + 50 * D]})
+    rows = [{"time": t0 + 2 * H, "coin": "BTC", "szi": "1.0", "usdc": "-1.0", "fundingRate": "0.00001", "nSamples": None}]
+    rs = start_check(events, rows, fills, t0)
+    eth = [c for c in rs["coins"] if c["coin"] == "ETH"]
+    assert rs["checked"] and eth and eth[0]["gap_usd"] == 100 * 2000.0
+    # the same book that really was held from the start passes
+    rows.append({"time": t0 + 2 * H, "coin": "ETH", "szi": "100.0", "usdc": "-2.0", "fundingRate": "0.00001", "nSamples": None})
+    rs = start_check(events, rows, fills, t0)
+    assert not [c for c in rs["coins"] if c["coin"] == "ETH"]
+
+
+def test_longer_delay_must_also_leave_the_follower_richer():
+    s = summary()
+    s["oos_120"]["ret_comp"] = -0.1  # positive mean at 2 h, but the follower ends poorer
+    v, why = classify(s, CFG, q=0.02)
+    assert v != "aprovada" and any("120 min" in w for w in why)
+
+
+def test_positions_carried_into_the_test_are_not_entries():
+    import pandas as pd
+    from types import SimpleNamespace
+    from hlwf.evaluate import style
+    H = 3_600_000
+    hours = NOW + H * np.arange(48)
+    he = pd.DataFrame({c: np.full(48, 0.1) for c in "ABCDEFGHIJ"}, index=hours)
+    assert style(SimpleNamespace(hourly_expo=he), NOW)["opens"] == 0

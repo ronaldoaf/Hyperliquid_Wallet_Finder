@@ -161,3 +161,21 @@ def test_position_jumps_are_listed():
     j = position_jumps(prepare_fills([fill(T0 + H, "BTC", "B", 1, 0), fill(T0 + 10 * H, "BTC", "B", 1, 3)]))
     assert len(j) == 1 and j["size"].iloc[0] == pytest.approx(2.0) and j["time"].iloc[0] == T0 + 10 * H
     assert position_jumps(prepare_fills([fill(T0 + H, "BTC", "B", 1, 0), fill(T0 + 2 * H, "BTC", "B", 1, 1)])).empty
+
+
+def test_equity_is_known_only_as_of_its_reading():
+    from hlwf.copysim import equity_on
+    eq = pd.Series([100.0, 200.0], index=[T0, T0 + 7 * D])
+    # three days in, the follower still knows only the first reading (no interpolation)
+    assert equity_on(eq, np.array([T0 + 3 * D, T0 + 7 * D, T0 - D])).tolist() == [100.0, 200.0, 100.0]
+
+
+def test_last_partial_day_is_marked_at_end_price():
+    class AsOf(LinearOracle):
+        def price_asof(self, T):
+            return float(self.price(T))
+
+    end = T0 + 2 * D + 6 * H  # the last day is cut at 06:00
+    res = run([fill(T0 + H, "BTC", "B", 1, 0)], 0, end=end, oracle=AsOf())
+    o = AsOf()
+    assert res.daily["pnl"].sum() == pytest.approx(o.price(end) - o.price(T0 + H))
