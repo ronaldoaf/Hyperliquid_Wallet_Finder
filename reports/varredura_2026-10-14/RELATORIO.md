@@ -1,5 +1,7 @@
 # Varredura de 14/10/2026: carteiras copiáveis com atraso
 
+> **Aviso (15/10/2026): relatório inválido.** Gerado com um código que tinha um erro na paginação dos fills (as posições ficavam congeladas por semanas na simulação) e sem as fatias de TWAP e as dex HIP-3. Os números abaixo não valem; o arquivo fica só como registro. Veja [`PROGRESSO.md`](../../PROGRESSO.md).
+
 Carteiras da Hyperliquid cuja estratégia em perps **continua lucrativa quando copiada com pelo menos 30 minutos de atraso**, depois de taxas, spread e funding, num período que **não** foi usado para escolhê-las. O método está no [README](../../README.md#método).
 
 ## Resumo
